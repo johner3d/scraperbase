@@ -15,7 +15,7 @@ export function seedEbaySearch(db: DatabaseSync, opts: SeedEbaySearchOptions): v
     source: 'ebay',
     queue: 'ebay_search',
     entityType: 'search_page',
-    scopeKey: searchPageScopeKey(opts.marketplace, opts.query, 0),
+    scopeKey: searchPageScopeKey(opts.marketplace, opts.query, 0, opts.limit, opts.maxItems),
     params: { marketplace: opts.marketplace, query: opts.query, offset: 0, limit: opts.limit, maxItems: opts.maxItems },
   });
 }

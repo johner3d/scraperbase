@@ -227,6 +227,17 @@ function acquisitionRawStats(db:DatabaseSync,source:string):{objects:number;byte
       JOIN raw_objects ro ON ro.hash=o.hash WHERE w.source=? GROUP BY ro.hash)`).get(source) as Row;
   return{objects:integer(row.objects),bytes:integer(row.bytes),latest:text(row.latest)};
 }
+function imageLinkSourceStatus(db:DatabaseSync,source:string,queue:string,label:string):SourceStatus{
+  const raw=acquisitionRawStats(db,source);
+  const work=db.prepare(`SELECT COUNT(*) total,SUM(state='succeeded') succeeded,SUM(state IN ('pending','leased','running','retryable_failed','partial')) pending FROM work_items WHERE source=? AND queue=?`).get(source,queue) as Row;
+  const linked=integer((db.prepare(`SELECT COUNT(*) n FROM assets WHERE rendition LIKE ?`).get(`${source}:%`) as Row).n);
+  const succeeded=integer(work.succeeded),total=integer(work.total);
+  return {source,label,latestObservation:raw.latest,sourceRecords:succeeded,matchedRecords:linked,unresolvedRecords:Math.max(succeeded-linked,0),rawObjects:raw.objects,rawBytes:raw.bytes,openReviews:0,status:!total?'empty':integer(work.pending)?'partial':'ready'};
+}
+function rawOnlySourceStatus(db:DatabaseSync,source:string,label:string):SourceStatus{
+  const raw=acquisitionRawStats(db,source);
+  return {source,label,latestObservation:raw.latest,sourceRecords:0,matchedRecords:0,unresolvedRecords:0,rawObjects:raw.objects,rawBytes:raw.bytes,openReviews:0,status:raw.objects?'partial':'empty'};
+}
 export function listSources(db:DatabaseSync):SourceStatus[]{
   const tcg=db.prepare(`SELECT COUNT(*) records,SUM(CASE WHEN entity_type='card' THEN 1 ELSE 0 END) cards FROM source_records WHERE source='tcgdex'`).get() as Row;
   const work=db.prepare(`SELECT SUM(CASE WHEN entity_type='set' AND state='succeeded' THEN 1 ELSE 0 END) indexed_count,
@@ -249,7 +260,11 @@ export function listSources(db:DatabaseSync):SourceStatus[]{
   });
   const imagePending=languages.reduce((sum,item)=>sum+item.imagesPending,0);
   const result:SourceStatus[]=[{source:'tcgdex',label:'TCGdex catalogue',latestObservation:tcgRaw.latest,sourceRecords:integer(tcg.records),matchedRecords:integer(tcg.records),unresolvedRecords:0,rawObjects:tcgRaw.objects,rawBytes:tcgRaw.bytes,openReviews:0,status:!integer(tcg.records)?'empty':integer(work.queued_count)||imagePending?'partial':'ready',indexed:integer(work.indexed_count),hydrated:integer(work.hydrated_count),queued:integer(work.queued_count),languages}];
-  for(const namespace of ['population','sales'] as const){const stat=db.prepare(`SELECT COUNT(DISTINCT sr.source_record_id) records,COUNT(DISTINCT CASE WHEN sl.match_status IN ('matched','manual') THEN sr.source_record_id END) matched FROM source_records sr LEFT JOIN source_links sl ON sl.source_record_id=sr.source_record_id WHERE sr.source='psa' AND sr.namespace=?`).get(namespace) as Row;const unresolved=integer(stat.records)-integer(stat.matched);const raw=rawStats(db,'psa',namespace);const reviews=integer((db.prepare(`SELECT COUNT(*) n FROM match_reviews mr JOIN source_records sr ON sr.source_record_id=mr.source_record_id WHERE mr.status='open' AND sr.namespace=?`).get(namespace) as Row).n);result.push({source:`psa-${namespace}`,label:namespace==='population'?'PSA population & price guide':'PSA auction sales',latestObservation:raw.latest,sourceRecords:integer(stat.records),matchedRecords:integer(stat.matched),unresolvedRecords:unresolved,rawObjects:raw.objects,rawBytes:raw.bytes,openReviews:reviews,status:!integer(stat.records)?'empty':unresolved?'partial':'ready'});}return result;
+  for(const namespace of ['population','sales'] as const){const stat=db.prepare(`SELECT COUNT(DISTINCT sr.source_record_id) records,COUNT(DISTINCT CASE WHEN sl.match_status IN ('matched','manual') THEN sr.source_record_id END) matched FROM source_records sr LEFT JOIN source_links sl ON sl.source_record_id=sr.source_record_id WHERE sr.source='psa' AND sr.namespace=?`).get(namespace) as Row;const unresolved=integer(stat.records)-integer(stat.matched);const raw=rawStats(db,'psa',namespace);const reviews=integer((db.prepare(`SELECT COUNT(*) n FROM match_reviews mr JOIN source_records sr ON sr.source_record_id=mr.source_record_id WHERE mr.status='open' AND sr.namespace=?`).get(namespace) as Row).n);result.push({source:`psa-${namespace}`,label:namespace==='population'?'PSA population & price guide':'PSA auction sales',latestObservation:raw.latest,sourceRecords:integer(stat.records),matchedRecords:integer(stat.matched),unresolvedRecords:unresolved,rawObjects:raw.objects,rawBytes:raw.bytes,openReviews:reviews,status:!integer(stat.records)?'empty':unresolved?'partial':'ready'});}
+  result.push(imageLinkSourceStatus(db,'pokemoncard','pokemoncard_images','Pokémon-card.com images (JA)'));
+  result.push(imageLinkSourceStatus(db,'pcgsearch','pcgsearch_images','PCG Search images (vintage JA)'));
+  result.push(rawOnlySourceStatus(db,'ebay','eBay raw fetch'));
+  return result;
 }
 export function getFacets(db:DatabaseSync):FacetsData{
   const values=(sql:string)=> (db.prepare(sql).all() as unknown as Array<{value:string}>).map((row)=>row.value).filter(Boolean);

@@ -33,7 +33,9 @@ export const EBAY_MARKETPLACES: Record<EbayMarketplaceKey, EbayMarketplaceDef> =
 
 export const DEFAULT_EBAY_QUERY = 'pikachu psa 10';
 export const DEFAULT_EBAY_PAGE_LIMIT = 200;
-export const DEFAULT_EBAY_MAX_ITEMS = 1000;
+// Zero means uncapped. Raw acquisition should be complete by default; callers
+// must opt into a safety cap explicitly (for example during a smoke test).
+export const DEFAULT_EBAY_MAX_ITEMS = 0;
 
 const EBAY_ENV_FILE = path.join(PROJECT_ROOT, 'ibbi', '.env');
 

@@ -191,10 +191,17 @@ export async function runCommand(args: string[]): Promise<void> {
       const query = values.query as string;
       const maxItems = Number(values['max-items']);
       const limit = Number(values.limit);
-      const marketplaces = (values.marketplaces as string)
+      const requestedMarketplaces = (values.marketplaces as string)
         .split(',')
         .map((s) => s.trim())
-        .filter((s): s is EbayMarketplaceKey => Boolean(s) && s in EBAY_MARKETPLACES);
+        .filter(Boolean);
+      const invalidMarketplaces = requestedMarketplaces.filter((s) => !(s in EBAY_MARKETPLACES));
+      if (invalidMarketplaces.length > 0) throw new Error(`Invalid --marketplaces: ${invalidMarketplaces.join(', ')}`);
+      const marketplaces = requestedMarketplaces as EbayMarketplaceKey[];
+      if (marketplaces.length === 0) throw new Error('--marketplaces must contain at least one marketplace');
+      if (!query.trim()) throw new Error('--query must not be empty');
+      if (!Number.isInteger(maxItems) || maxItems < 0) throw new Error('--max-items must be a non-negative integer (0 means uncapped)');
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('--limit must be an integer from 1 to 200');
       const rateLimiter = createRateLimiter({ minDelayMs: 250, jitterMs: 150 });
 
       for (const marketplace of marketplaces) {

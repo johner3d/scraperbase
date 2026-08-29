@@ -42,8 +42,18 @@ export function createEbayItemDetailCollector(deps: ItemDetailDeps): Collector {
         requestMethod: 'GET',
         requestUrl: url,
         requestParams: params,
+        responseHeaders: res.headers,
+        byteSize: res.body.byteLength,
         durationMs: res.durationMs,
         errorMessage: `HTTP ${res.status} fetching item ${params.itemId}`,
+        object: res.body.byteLength > 0 ? {
+          source: 'ebay',
+          mediaKind: 'json' as const,
+          mediaType: res.headers['content-type'] ?? 'application/json',
+          ext: 'json',
+          body: res.body,
+          dirs: EBAY_RAW_DIRS,
+        } : undefined,
       };
     }
 

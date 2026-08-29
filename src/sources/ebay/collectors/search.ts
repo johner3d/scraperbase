@@ -27,11 +27,16 @@ interface SearchResponseBody {
   itemSummaries?: ItemSummaryBrief[];
 }
 
-function buildSearchUrl(params: SearchParams): string {
+export function requestLimit(params: SearchParams): number {
+  if (params.maxItems === 0) return params.limit;
+  return Math.min(params.limit, params.maxItems - params.offset);
+}
+
+export function buildSearchUrl(params: SearchParams): string {
   const def = EBAY_MARKETPLACES[params.marketplace];
   const qs = new URLSearchParams({
     q: params.query,
-    limit: String(params.limit),
+    limit: String(requestLimit(params)),
     offset: String(params.offset),
   });
   if (def.itemLocationCountries?.length) {
@@ -69,8 +74,18 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
         requestMethod: 'GET',
         requestUrl: url,
         requestParams: params,
+        responseHeaders: res.headers,
+        byteSize: res.body.byteLength,
         durationMs: res.durationMs,
         errorMessage: `HTTP ${res.status} fetching search page (offset=${params.offset})`,
+        object: res.body.byteLength > 0 ? {
+          source: 'ebay',
+          mediaKind: 'json' as const,
+          mediaType: res.headers['content-type'] ?? 'application/json',
+          ext: 'json',
+          body: res.body,
+          dirs: EBAY_RAW_DIRS,
+        } : undefined,
       };
     }
 
@@ -111,19 +126,19 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
         source: 'ebay',
         queue: 'ebay_item_detail',
         entityType: 'item',
-        scopeKey: itemScopeKey(summary.itemId),
+        scopeKey: itemScopeKey(params.marketplace, summary.itemId),
         params: { marketplace: params.marketplace, itemId: summary.itemId },
       });
     }
 
-    const nextOffset = params.offset + params.limit;
+    const nextOffset = params.offset + requestLimit(params);
     const total = parsed.total ?? 0;
-    if (nextOffset < total && nextOffset < params.maxItems) {
+    if (nextOffset < total && (params.maxItems === 0 || nextOffset < params.maxItems)) {
       enqueueNext.push({
         source: 'ebay',
         queue: 'ebay_search',
         entityType: 'search_page',
-        scopeKey: searchPageScopeKey(params.marketplace, params.query, nextOffset),
+        scopeKey: searchPageScopeKey(params.marketplace, params.query, nextOffset, params.limit, params.maxItems),
         params: { ...params, offset: nextOffset },
       });
     }

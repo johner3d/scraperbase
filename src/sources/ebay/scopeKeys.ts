@@ -1,10 +1,17 @@
-export function searchPageScopeKey(marketplace: string, query: string, offset: number): string {
-  return `search:${marketplace}:${query}:offset=${offset}`;
+export function searchPageScopeKey(
+  marketplace: string,
+  query: string,
+  offset: number,
+  limit: number,
+  maxItems: number,
+): string {
+  const cap = maxItems === 0 ? 'all' : String(maxItems);
+  return `search:${marketplace}:${query}:limit=${limit}:max=${cap}:offset=${offset}`;
 }
 
-// Deliberately marketplace/query-independent: the same eBay item found by
-// two different searches (or the same search on two marketplaces) is only
-// ever detail-fetched once.
-export function itemScopeKey(itemId: string): string {
-  return `item:${itemId}`;
+// Query-independent but marketplace-specific: a repeated hit within one
+// marketplace is deduplicated, while potentially different marketplace views
+// of the same listing are each retained as raw observations.
+export function itemScopeKey(marketplace: string, itemId: string): string {
+  return `item:${marketplace}:${itemId}`;
 }
