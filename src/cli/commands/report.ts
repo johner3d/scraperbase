@@ -9,6 +9,7 @@ interface RunRow {
   started_at: string;
   ended_at: string | null;
   cli_command: string;
+  config_json: string;
 }
 
 export async function reportCommand(args: string[]): Promise<void> {
@@ -31,7 +32,10 @@ export async function reportCommand(args: string[]): Promise<void> {
   }
 
   const counters = getCounters(db, run.run_id);
-  const stateCounts = db.prepare('SELECT state, COUNT(*) as n FROM work_items GROUP BY state').all() as {
+  const config=JSON.parse((run as RunRow).config_json) as {source?:string;stage?:string};
+  const stateCounts = (config.source
+    ? db.prepare('SELECT state, COUNT(*) as n FROM work_items WHERE source=? GROUP BY state').all(config.source)
+    : db.prepare('SELECT state, COUNT(*) as n FROM work_items GROUP BY state').all()) as unknown as {
     state: string;
     n: number;
   }[];

@@ -163,6 +163,9 @@ export interface RunQueueOptions {
   runId: string;
   pollIntervalMs?: number;
   isDraining: () => boolean;
+  entityTypes?: string[];
+  minimumPriority?: number;
+  scopeContains?: string;
 }
 
 /**
@@ -181,7 +184,12 @@ export async function runQueue(db: DatabaseSync, opts: RunQueueOptions): Promise
 
   async function worker(): Promise<void> {
     while (!opts.isDraining()) {
-      const item = claimNext(db, opts.queue, leaseOwner, opts.leaseTtlMs);
+      db.prepare('UPDATE runs SET heartbeat_at = ? WHERE run_id = ?').run(new Date().toISOString(), opts.runId);
+      const item = claimNext(db, opts.queue, leaseOwner, opts.leaseTtlMs, {
+        entityTypes: opts.entityTypes,
+        minimumPriority: opts.minimumPriority,
+        scopeContains: opts.scopeContains,
+      });
       if (!item) {
         if (activeCount === 0) return;
         await sleep(pollMs);

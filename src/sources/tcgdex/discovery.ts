@@ -27,7 +27,7 @@ interface SetBrief {
 export function createTcgdexDiscoveryCollector(deps: DiscoveryDeps): Collector {
   return async (_db, item) => {
     const { lang } = JSON.parse(item.params_json) as { lang: string };
-    const url = `${TCGDEX_API_BASE}/${lang}/sets`;
+    const url = `${TCGDEX_API_BASE}/${encodeURIComponent(lang)}/sets`;
 
     await deps.rateLimiter();
     const res = await fetchRaw(url);

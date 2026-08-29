@@ -7,11 +7,15 @@ import { runCommand, type RunCliOptions } from './run.ts';
  * command. This just re-reads the previous run's config and calls `run`
  * again so the user doesn't have to retype flags.
  */
-export async function resumeCommand(_args: string[]): Promise<void> {
+export async function resumeCommand(argsInput: string[]): Promise<void> {
   const db = openCliDb();
-  const last = db.prepare('SELECT config_json FROM runs ORDER BY created_at DESC LIMIT 1').get() as
-    | { config_json: string }
+  const requested = argsInput[0];
+  const last = (requested
+    ? db.prepare('SELECT run_id,config_json FROM runs WHERE run_id=?').get(requested)
+    : db.prepare("SELECT run_id,config_json FROM runs WHERE status IN ('running','cancelled','failed') AND cli_command LIKE 'run --source %' ORDER BY created_at DESC LIMIT 1").get()) as
+    | { run_id: string; config_json: string }
     | undefined;
+  if (last) db.prepare(`UPDATE runs SET status='cancelled',ended_at=?,heartbeat_at=? WHERE run_id=? AND status='running'`).run(new Date().toISOString(),new Date().toISOString(),last.run_id);
   db.close();
 
   if (!last) {
@@ -34,6 +38,10 @@ export async function resumeCommand(_args: string[]): Promise<void> {
     String(cfg.syntheticDelayMs),
     '--lang',
     cfg.lang,
+    '--stage',
+    cfg.stage ?? 'index',
+    '--priority',
+    cfg.priority ?? 'psa',
   ];
   if (cfg.scope) args.push('--scope', cfg.scope);
   await runCommand(args);

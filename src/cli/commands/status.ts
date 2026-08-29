@@ -7,6 +7,7 @@ interface RunRow {
   status: string;
   started_at: string;
   ended_at: string | null;
+  config_json: string;
 }
 
 export async function statusCommand(args: string[]): Promise<void> {
@@ -23,8 +24,8 @@ export async function statusCommand(args: string[]): Promise<void> {
   const render = (): void => {
     const run = (
       values.run
-        ? db.prepare('SELECT run_id, status, started_at, ended_at FROM runs WHERE run_id = ?').get(values.run as string)
-        : db.prepare('SELECT run_id, status, started_at, ended_at FROM runs ORDER BY created_at DESC LIMIT 1').get()
+        ? db.prepare('SELECT run_id, status, started_at, ended_at, config_json FROM runs WHERE run_id = ?').get(values.run as string)
+        : db.prepare('SELECT run_id, status, started_at, ended_at, config_json FROM runs ORDER BY created_at DESC LIMIT 1').get()
     ) as RunRow | undefined;
 
     if (values.watch) console.clear();
@@ -35,7 +36,10 @@ export async function statusCommand(args: string[]): Promise<void> {
     }
 
     const counters = getCounters(db, run.run_id);
-    const stateCounts = db.prepare('SELECT state, COUNT(*) as n FROM work_items GROUP BY state').all() as {
+    const config=JSON.parse(run.config_json) as {source?:string;stage?:string};
+    const stateCounts = (config.source
+      ? db.prepare('SELECT state, COUNT(*) as n FROM work_items WHERE source=? GROUP BY state').all(config.source)
+      : db.prepare('SELECT state, COUNT(*) as n FROM work_items GROUP BY state').all()) as unknown as {
       state: string;
       n: number;
     }[];
@@ -47,7 +51,7 @@ export async function statusCommand(args: string[]): Promise<void> {
       'acquisition  ' +
         (Object.keys(counters).length ? Object.entries(counters).map(([k, v]) => `${k}=${v}`).join('  ') : '(none yet)'),
     );
-    console.log('work items   ' + stateCounts.map((s) => `${s.state}=${s.n}`).join('  '));
+    console.log(`work items${config.source?` (${config.source}${config.stage?`/${config.stage}`:''})`:''}   ` + stateCounts.map((s) => `${s.state}=${s.n}`).join('  '));
   };
 
   if (values.watch) {

@@ -80,6 +80,22 @@ test('writeObject deduplicates identical content and never overwrites', async ()
   });
 });
 
+test('writeObject deduplicates identical content across concurrent workers', async () => {
+  await withTempStore(async (db, dirs) => {
+    const body = Buffer.from('concurrent-duplicate');
+    const results = await Promise.all(Array.from({ length: 12 }, () => writeObject(
+      db,
+      { source: 'tcgdex', mediaKind: 'image', mediaType: 'image/webp', ext: 'webp', body },
+      dirs,
+    )));
+
+    assert.equal(results.filter((result) => result.isNew).length, 1);
+    assert.equal(new Set(results.map((result) => result.storagePath)).size, 1);
+    const count = db.prepare('SELECT COUNT(*) as n FROM raw_objects').get() as { n: number };
+    assert.equal(count.n, 1);
+  });
+});
+
 test('writeObject detects on-disk corruption of an existing object instead of silently overwriting', async () => {
   await withTempStore(async (db, dirs) => {
     const body = Buffer.from('original-content');

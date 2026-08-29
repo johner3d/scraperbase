@@ -17,6 +17,20 @@ const EXPECTED_TABLES = [
   'parser_executions',
   'events',
   'counters',
+  'source_records',
+  'sets',
+  'cards',
+  'variants',
+  'source_links',
+  'match_reviews',
+  'match_overrides',
+  'assets',
+  'psa_specs',
+  'psa_spec_pairs',
+  'psa_population_current',
+  'psa_price_current',
+  'psa_census_current',
+  'psa_sales',
 ];
 
 test('openDb creates every table and is idempotent across repeated opens', async () => {
@@ -33,9 +47,12 @@ test('openDb creates every table and is idempotent across repeated opens', async
 
     // Re-opening (simulating a second process/run) must not error or reset data.
     const db2 = openDb(dbPath);
-    const version = db2.prepare('PRAGMA user_version').get() as { user_version: number };
-    assert.equal(version.user_version, 1);
-    db2.close();
+    try {
+      const version = db2.prepare('PRAGMA user_version').get() as { user_version: number };
+      assert.equal(version.user_version, 5);
+    } finally {
+      db2.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

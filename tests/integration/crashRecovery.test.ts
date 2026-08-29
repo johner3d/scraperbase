@@ -43,13 +43,13 @@ function plain<T>(rows: T[]): T[] {
  * with EBUSY. Retry instead of failing the test over cleanup timing.
  */
 async function rmWithRetry(dir: string): Promise<void> {
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < 40; attempt++) {
     try {
       await rm(dir, { recursive: true, force: true });
       return;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EBUSY' || attempt === 9) throw err;
-      await sleep(100);
+      await sleep(150);
     }
   }
 }
@@ -150,6 +150,10 @@ test(
           .all();
         assert.deepEqual(duplicated, []);
       } finally {
+        // The v2/v3 schema creates enough metadata that the WAL can be large
+        // on Windows; checkpoint it before recursive temp-directory cleanup
+        // so antivirus/indexer handles do not race rm().
+        finalDb.exec('PRAGMA wal_checkpoint(TRUNCATE)');
         finalDb.close();
       }
     } finally {

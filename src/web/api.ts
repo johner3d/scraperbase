@@ -1,0 +1,259 @@
+import type { DatabaseSync } from 'node:sqlite';
+import type {
+  CardDetail, CardSearchItem, FacetsData, HealthData, MarketData, MatchReviewItem, Page,
+  PopulationData, SaleRow, SortOption, SourceStatus, VariantDetail, VariantSearchItem,
+} from './types.ts';
+
+type SqlValue = string | number | null;
+type Row = Record<string, unknown>;
+
+const CARD_SORTS: Partial<Record<SortOption, string>> = {
+  set_number: 'release_date IS NULL, release_date ASC, source_set_id ASC, local_sort_key ASC',
+  newest: 'release_date IS NULL, release_date DESC, set_name COLLATE NOCASE ASC, local_sort_key ASC',
+  oldest: 'release_date IS NULL, release_date ASC, set_name COLLATE NOCASE ASC, local_sort_key ASC',
+  name_asc: 'name COLLATE NOCASE ASC, source_set_id ASC, local_sort_key ASC',
+  name_desc: 'name COLLATE NOCASE DESC, source_set_id ASC, local_sort_key ASC',
+  number_asc: 'local_sort_key ASC', number_desc: 'local_sort_key DESC',
+};
+const VARIANT_SORTS: Partial<Record<SortOption, string>> = {
+  set_number: 'v.release_date IS NULL, v.release_date ASC, v.source_set_id ASC, v.local_sort_key ASC, v.variant_id ASC',
+  newest: 'v.release_date IS NULL, v.release_date DESC, v.set_name COLLATE NOCASE ASC, v.local_sort_key ASC',
+  oldest: 'v.release_date IS NULL, v.release_date ASC, v.set_name COLLATE NOCASE ASC, v.local_sort_key ASC',
+  name_asc: 'v.name COLLATE NOCASE ASC, v.set_name COLLATE NOCASE ASC, v.local_sort_key ASC',
+  name_desc: 'v.name COLLATE NOCASE DESC, v.set_name COLLATE NOCASE ASC, v.local_sort_key ASC',
+  number_asc: 'v.local_sort_key ASC', number_desc: 'v.local_sort_key DESC',
+  gem_rate_desc: 'm.gem_rate IS NULL, m.gem_rate DESC, v.local_sort_key ASC',
+  gem_rate_asc: 'm.gem_rate IS NULL, m.gem_rate ASC, v.local_sort_key ASC',
+  pop_psa10_desc: 'm.psa10_population IS NULL, m.psa10_population DESC, v.local_sort_key ASC',
+  pop_psa10_asc: 'm.psa10_population IS NULL, m.psa10_population ASC, v.local_sort_key ASC',
+  psa10_price_desc: 'm.latest_psa10_price IS NULL, m.latest_psa10_price DESC, v.local_sort_key ASC',
+  psa10_price_asc: 'm.latest_psa10_price IS NULL, m.latest_psa10_price ASC, v.local_sort_key ASC',
+  sales12mo_desc: 'm.sales_12mo IS NULL, m.sales_12mo DESC, v.local_sort_key ASC',
+  sales12mo_asc: 'm.sales_12mo IS NULL, m.sales_12mo ASC, v.local_sort_key ASC',
+};
+
+function text(value: unknown): string | null { return value == null ? null : String(value) }
+function number(value: unknown): number | null { return value == null || value === '' ? null : Number(value) }
+function integer(value: unknown): number { return Number(value ?? 0) }
+function object(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'string') return {};
+  try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}; } catch { return {}; }
+}
+function strings(value: unknown): string[] {
+  if (typeof value !== 'string') return [];
+  try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed.map(String) : []; } catch { return []; }
+}
+function pageArgs(search: URLSearchParams): { page: number; pageSize: number } {
+  const page = Math.max(1, Math.floor(Number(search.get('page') ?? 1) || 1));
+  return { page, pageSize: Math.min(60, Math.max(1, Math.floor(Number(search.get('pageSize') ?? 24) || 24))) };
+}
+function cardSortValue(value: string | null): SortOption { return value && value in CARD_SORTS ? value as SortOption : 'set_number' }
+function variantSortValue(value: string | null): SortOption { return value && value in VARIANT_SORTS ? value as SortOption : 'set_number' }
+function searchWhere(search: URLSearchParams, prefix = ''): { sql: string; params: SqlValue[] } {
+  const clauses: string[] = [], params: SqlValue[] = [];
+  const q = search.get('q')?.trim();
+  if (q) { clauses.push(`(${prefix}name LIKE ? OR ${prefix}set_name LIKE ? OR ${prefix}local_id LIKE ? OR COALESCE(${prefix}number,'') LIKE ?)`); const p=`%${q}%`; params.push(p,p,p,p); }
+  for (const [query,column] of [['language','language'],['category','category'],['rarity','rarity']] as const) { const value=search.get(query); if(value){clauses.push(`${prefix}${column}=?`);params.push(value);} }
+  const set=search.get('set'); if(set){clauses.push(`(${prefix}source_set_id=? OR ${prefix}set_name=?)`);params.push(set,set);}
+  return { sql: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
+}
+
+const RANGE_FIELDS = [
+  ['psa10Price', 'm.latest_psa10_price'], ['avgPsa10Price', 'm.avg_psa10_price'],
+  ['popPsa10', 'm.psa10_population'], ['totalGraded', 'm.total_graded'],
+  ['gemRate', 'm.gem_rate'], ['sales12mo', 'm.sales_12mo'], ['lastSalePrice', 'm.latest_sale_price'],
+] as const;
+function rangeClauses(search: URLSearchParams): { sql: string[]; params: SqlValue[] } {
+  const sql: string[] = [], params: SqlValue[] = [];
+  for (const [key, column] of RANGE_FIELDS) {
+    const min = search.get(`${key}Min`), max = search.get(`${key}Max`);
+    if (min) { sql.push(`${column} >= ?`); params.push(Number(min)); }
+    if (max) { sql.push(`${column} <= ?`); params.push(Number(max)); }
+  }
+  return { sql, params };
+}
+// One CTE powers both list-time filtering/sorting and item display, so the
+// numbers a filter range narrows on always match the numbers rendered.
+// `idFilter` restricts the underlying psa_specs scan to a known id set (used
+// by summaryRows for single-card/variant lookups); omitted for the full list.
+function variantMetricsCte(idFilter?: { sql: string; params: SqlValue[] }): { sql: string; params: SqlValue[] } {
+  const cutoff = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
+  const extra = idFilter ? ` AND ${idFilter.sql}` : '';
+  const sql = `latest_pop AS (SELECT *,ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY fetched_at DESC,psa_spec_pk DESC) rn
+      FROM psa_specs WHERE namespace='population' AND match_status IN ('matched','manual')${extra}),
+    pop AS (SELECT lp.variant_id,MAX(p.total_population) total_graded,
+      SUM(CASE WHEN p.grade_value=10 AND p.qualified=0 THEN p.population_count ELSE 0 END) psa10_population
+      FROM latest_pop lp JOIN psa_population_current p ON p.population_spec_pk=lp.psa_spec_pk WHERE lp.rn=1 GROUP BY lp.variant_id),
+    price AS (SELECT lp.variant_id,pc.psa_price latest_psa10_price,pc.average_price avg_psa10_price
+      FROM latest_pop lp JOIN psa_price_current pc ON pc.population_spec_pk=lp.psa_spec_pk WHERE lp.rn=1 AND pc.grade_value=10),
+    latest_sales_spec AS (SELECT *,ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY fetched_at DESC,psa_spec_pk DESC) rn
+      FROM psa_specs WHERE namespace='sales' AND match_status IN ('matched','manual')${extra}),
+    ranked_sales AS (SELECT lss.variant_id,s.sale_price,s.sale_date,
+      ROW_NUMBER() OVER(PARTITION BY lss.variant_id ORDER BY s.sale_date DESC,s.sale_row_id DESC) rn,
+      COUNT(*) OVER(PARTITION BY lss.variant_id) sale_count,
+      SUM(CASE WHEN s.grade_value=10 AND s.sale_date>=? THEN 1 ELSE 0 END) OVER(PARTITION BY lss.variant_id) sales_12mo
+      FROM latest_sales_spec lss JOIN psa_sales s ON s.sales_spec_pk=lss.psa_spec_pk WHERE lss.rn=1),
+    metrics AS (SELECT v.variant_id,pop.total_graded,pop.psa10_population,
+      CASE WHEN pop.total_graded>0 THEN CAST(pop.psa10_population AS REAL)*100.0/pop.total_graded END gem_rate,
+      price.latest_psa10_price,price.avg_psa10_price,
+      rs.sale_price latest_sale_price,rs.sale_date latest_sale_date,COALESCE(rs.sale_count,0) sale_count,COALESCE(rs.sales_12mo,0) sales_12mo,
+      EXISTS(SELECT 1 FROM latest_pop lp WHERE lp.variant_id=v.variant_id AND lp.rn=1) population_available,
+      EXISTS(SELECT 1 FROM latest_sales_spec ls WHERE ls.variant_id=v.variant_id AND ls.rn=1) sales_available
+      FROM variants v LEFT JOIN pop ON pop.variant_id=v.variant_id LEFT JOIN price ON price.variant_id=v.variant_id
+      LEFT JOIN ranked_sales rs ON rs.variant_id=v.variant_id AND rs.rn=1)`;
+  const params = idFilter ? [...idFilter.params, ...idFilter.params, cutoff] : [cutoff];
+  return { sql, params };
+}
+function cardImage(db: DatabaseSync, cardId: number, fallback: unknown): string | null {
+  const has = db.prepare(`SELECT 1 FROM assets WHERE target_type='card' AND target_id=? LIMIT 1`).get(cardId);
+  return has || text(fallback) ? `/media/card/${cardId}` : null;
+}
+function cardItem(db: DatabaseSync, row: Row): CardSearchItem {
+  const cardId=integer(row.card_id);
+  const detailStatus=text(row.detail_status)==='hydrated'?'hydrated':'stub';
+  return { cardId,setId:integer(row.set_id),language:String(row.language),sourceSetId:String(row.source_set_id),setName:String(row.set_name),
+    series:text(row.series),releaseDate:text(row.release_date),localId:String(row.local_id),number:text(row.number),name:String(row.name),
+    category:text(row.category),rarity:text(row.rarity),imageUrl:cardImage(db,cardId,row.image_url),detailStatus,
+    variantCoverage:detailStatus==='hydrated'?'complete':'unknown',variantCount:row.variant_count==null?null:integer(row.variant_count) };
+}
+
+interface VariantSummary {
+  total_graded?: unknown; psa10_population?: unknown; latest_psa10_price?: unknown; avg_psa10_price?: unknown;
+  latest_sale_price?: unknown; latest_sale_date?: unknown; sale_count?: unknown; sales_12mo?: unknown;
+  population_available?: unknown; sales_available?: unknown;
+}
+function summaryRows(db:DatabaseSync,ids:number[]):Map<number,VariantSummary>{
+  if(!ids.length)return new Map(); const marks=ids.map(()=>'?').join(',');
+  const cte=variantMetricsCte({sql:`variant_id IN (${marks})`,params:ids});
+  const rows=db.prepare(`WITH ${cte.sql}
+    SELECT v.variant_id,m.total_graded,m.psa10_population,m.latest_psa10_price,m.avg_psa10_price,
+      m.latest_sale_price,m.latest_sale_date,m.sale_count,m.sales_12mo,m.population_available,m.sales_available
+    FROM variants v LEFT JOIN metrics m ON m.variant_id=v.variant_id WHERE v.variant_id IN (${marks})`).all(...cte.params,...ids) as unknown as Array<Row&{variant_id:number}>;
+  return new Map(rows.map((row)=>[integer(row.variant_id),row as VariantSummary]));
+}
+function variantItem(db:DatabaseSync,row:Row,summary:VariantSummary={}):VariantSearchItem{
+  const variantId=integer(row.variant_id),cardId=integer(row.card_id);
+  const population=Boolean(integer(summary.population_available)),sales=Boolean(integer(summary.sales_available));
+  const psaPopulationTotal=integer(summary.total_graded),psa10Population=integer(summary.psa10_population);
+  return {variantId,cardId,setId:integer(row.set_id),language:String(row.language),sourceSetId:String(row.source_set_id),setName:String(row.set_name),
+    localId:String(row.local_id),number:text(row.number),name:String(row.name),variantLabel:String(row.variant_label),finish:text(row.finish),
+    printRunMarker:text(row.print_run_marker),microVariant:text(row.micro_variant),size:text(row.size),stamps:strings(row.stamps_json),
+    identityStatus:(text(row.identity_status) as VariantSearchItem['identityStatus'])??'inferred',imageUrl:cardImage(db,cardId,row.image_url),
+    psaMatchStatus:population||sales?'matched':'none',psaPopulationTotal,psa10Population,
+    gemRate:psaPopulationTotal?psa10Population/psaPopulationTotal*100:null,
+    latestPsa10Price:number(summary.latest_psa10_price),avgPsa10Price:number(summary.avg_psa10_price),
+    latestSalePrice:number(summary.latest_sale_price),latestSaleDate:text(summary.latest_sale_date),
+    saleCount:integer(summary.sale_count),psa10Sales12Month:integer(summary.sales_12mo),
+    psaPopulationAvailable:population,psaSalesAvailable:sales};
+}
+
+export function listCards(db:DatabaseSync,search:URLSearchParams):Page<CardSearchItem>{
+  const {page,pageSize}=pageArgs(search),where=searchWhere(search),order=CARD_SORTS[cardSortValue(search.get('sort'))];
+  const total=integer((db.prepare(`SELECT COUNT(*) total FROM v_card_search ${where.sql}`).get(...where.params) as Row).total),totalPages=Math.ceil(total/pageSize),safe=totalPages?Math.min(page,totalPages):1;
+  const rows=db.prepare(`SELECT * FROM v_card_search ${where.sql} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...where.params,pageSize,(safe-1)*pageSize) as unknown as Row[];
+  return {items:rows.map((row)=>cardItem(db,row)),total,page:safe,pageSize,totalPages};
+}
+export function listVariants(db:DatabaseSync,search:URLSearchParams):Page<VariantSearchItem>{
+  const {page,pageSize}=pageArgs(search),where=searchWhere(search,'v.'),clauses=where.sql?[where.sql.slice(6)]:[],params=[...where.params];
+  for(const [query,column] of [['finish','finish'],['printRunMarker','print_run_marker'],['microVariant','micro_variant']] as const){const value=search.get(query);if(value){clauses.push(`v.${column}=?`);params.push(value);}}
+  const ranges=rangeClauses(search); clauses.push(...ranges.sql); params.push(...ranges.params);
+  const filter=clauses.length?`WHERE ${clauses.join(' AND ')}`:'',order=VARIANT_SORTS[variantSortValue(search.get('sort'))];
+  const cte=variantMetricsCte();
+  const from=`FROM v_variant_search v LEFT JOIN metrics m ON m.variant_id=v.variant_id`;
+  const total=integer((db.prepare(`WITH ${cte.sql} SELECT COUNT(*) total ${from} ${filter}`).get(...cte.params,...params) as Row).total),totalPages=Math.ceil(total/pageSize),safe=totalPages?Math.min(page,totalPages):1;
+  const rows=db.prepare(`WITH ${cte.sql} SELECT v.*,m.total_graded,m.psa10_population,m.latest_psa10_price,m.avg_psa10_price,
+      m.latest_sale_price,m.latest_sale_date,m.sale_count,m.sales_12mo,m.population_available,m.sales_available
+    ${from} ${filter} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...cte.params,...params,pageSize,(safe-1)*pageSize) as unknown as Row[];
+  return {items:rows.map((row)=>variantItem(db,row,row as unknown as VariantSummary)),total,page:safe,pageSize,totalPages};
+}
+function baseCard(db:DatabaseSync,cardId:number):CardSearchItem|null{const row=db.prepare(`SELECT * FROM v_card_search WHERE card_id=?`).get(cardId) as Row|undefined;return row?cardItem(db,row):null}
+export function getCard(db:DatabaseSync,cardId:number):CardDetail|null{
+  const card=baseCard(db,cardId);if(!card)return null;
+  const attrs=db.prepare(`SELECT attributes_json FROM cards WHERE card_id=?`).get(cardId) as Row;
+  // Keep source/materialization order: it is stable and preserves the intended
+  // issue sequence (base print, editions, then micro-variants) better than an
+  // alphabetical display-label sort.
+  const rows=db.prepare(`SELECT * FROM v_variant_search WHERE card_id=? ORDER BY variant_id`).all(cardId) as unknown as Row[];
+  const summaries=summaryRows(db,rows.map((row)=>integer(row.variant_id)));
+  const also=db.prepare(`SELECT other.card_id,s.language,s.name set_name,s.set_id FROM cards current JOIN sets current_set ON current_set.set_id=current.set_id
+    JOIN sets s ON s.source_set_id=current_set.source_set_id JOIN cards other ON other.set_id=s.set_id AND other.local_id=current.local_id
+    WHERE current.card_id=? AND other.card_id<>current.card_id ORDER BY s.language`).all(cardId) as unknown as Row[];
+  return {...card,attributes:object(attrs.attributes_json),variants:rows.map((row)=>variantItem(db,row,summaries.get(integer(row.variant_id)))),
+    alsoPrintedIn:also.map((row)=>({cardId:integer(row.card_id),language:String(row.language),setName:String(row.set_name),setId:integer(row.set_id)}))};
+}
+function variantRow(db:DatabaseSync,variantId:number):Row|undefined{return db.prepare(`SELECT * FROM v_variant_search WHERE variant_id=?`).get(variantId) as Row|undefined}
+export function getVariant(db:DatabaseSync,variantId:number):VariantDetail|null{
+  const row=variantRow(db,variantId);if(!row)return null;const detail=db.prepare(`SELECT * FROM v_variant_detail WHERE variant_id=?`).get(variantId) as Row;
+  const related=baseCard(db,integer(row.card_id));if(!related)return null;const summary=summaryRows(db,[variantId]).get(variantId);
+  const refs=db.prepare(`SELECT sr.source,sr.namespace,sr.source_key,sl.match_status,ps.source_url FROM source_links sl JOIN source_records sr ON sr.source_record_id=sl.source_record_id
+    LEFT JOIN psa_specs ps ON ps.source_record_id=sr.source_record_id WHERE sl.target_type='variant' AND sl.target_id=? ORDER BY sr.source,sr.namespace,sr.source_key`).all(variantId) as unknown as Row[];
+  return {...variantItem(db,row,summary),variantKey:String(detail.variant_key),releaseDate:text(detail.release_date),attributes:object(detail.variant_attributes_json),
+    cardAttributes:object(detail.card_attributes_json),matchedSourceCount:integer(detail.matched_source_count),assetCount:integer(detail.asset_count),relatedCard:related,
+    sourceReferences:refs.map((ref)=>({source:String(ref.source),namespace:String(ref.namespace),sourceKey:String(ref.source_key),status:String(ref.match_status),url:text(ref.source_url)}))};
+}
+function matchedSpec(db:DatabaseSync,variantId:number,namespace:'population'|'sales'):Row|undefined{return db.prepare(`SELECT * FROM psa_specs WHERE variant_id=? AND namespace=? AND match_status IN ('matched','manual') ORDER BY fetched_at DESC,psa_spec_pk DESC LIMIT 1`).get(variantId,namespace) as Row|undefined}
+function sale(row:Row):SaleRow{return {saleRowId:integer(row.sale_row_id),saleItemId:String(row.sale_item_id),saleDate:text(row.sale_date),salePrice:number(row.sale_price),currency:String(row.currency??'USD'),gradeValue:number(row.grade_value),auctionHouse:text(row.auction_house),saleType:text(row.sale_type),certNumber:text(row.cert_number),lotNumber:text(row.lot_number),listingUrl:text(row.listing_url),qualifierCode:text(row.qualifier_code)}}
+export function getMarket(db:DatabaseSync,variantId:number):MarketData{
+  const pop=matchedSpec(db,variantId,'population'),salesSpec=matchedSpec(db,variantId,'sales');
+  const price=pop?db.prepare(`SELECT psa_price,average_price FROM psa_price_current WHERE population_spec_pk=? AND grade_value=10 ORDER BY observed_at DESC LIMIT 1`).get(integer(pop.psa_spec_pk)) as Row|undefined:undefined;
+  const pop10=pop?db.prepare(`SELECT COALESCE(SUM(CASE WHEN qualified=0 THEN population_count ELSE 0 END),0)n,MAX(total_population) total FROM psa_population_current WHERE population_spec_pk=? AND grade_value=10`).get(integer(pop.psa_spec_pk)) as Row:{n:0,total:0};
+  const sales=salesSpec?(db.prepare(`SELECT * FROM psa_sales WHERE sales_spec_pk=? AND grade_value=10 ORDER BY sale_date,sale_row_id`).all(integer(salesSpec.psa_spec_pk)) as unknown as Row[]).map(sale):[];
+  const byMonth=new Map<string,number[]>();for(const item of sales){if(!item.saleDate||item.salePrice==null)continue;const month=item.saleDate.slice(0,7),values=byMonth.get(month)??[];values.push(item.salePrice);byMonth.set(month,values);}
+  const monthly=[...byMonth].sort(([a],[b])=>a.localeCompare(b)).map(([month,values])=>{values.sort((a,b)=>a-b);const middle=Math.floor(values.length/2);const median=values.length%2?values[middle]!:(values[middle-1]!+values[middle]!)/2;return{month,medianPrice:median,count:values.length}});
+  const cutoff=new Date(Date.now()-365*86400000).toISOString().slice(0,10),totalGraded=integer(pop10.total),psa10=integer(pop10.n);
+  return {populationAvailable:Boolean(pop),priceGuideAvailable:Boolean(price),salesAvailable:Boolean(salesSpec),psa10Price:number(price?.psa_price),averagePsa10Price:number(price?.average_price),psa10Population:psa10,totalGraded,gemRate:totalGraded?psa10/totalGraded*100:null,
+    sales12Month:sales.filter((item)=>(item.saleDate??'')>=cutoff).length,coverage:{from:sales[0]?.saleDate??null,to:sales.at(-1)?.saleDate??null,count:sales.length,
+      cutoff:text(salesSpec?.coverage_cutoff),totalCount:number(salesSpec?.coverage_total_count),pagesFetched:number(salesSpec?.coverage_pages_fetched),complete:salesSpec?.coverage_complete==null?null:Boolean(integer(salesSpec.coverage_complete))},sales,monthly};
+}
+export function getPopulation(db:DatabaseSync,variantId:number):PopulationData{
+  const spec=matchedSpec(db,variantId,'population');if(!spec)return{available:false,observedAt:null,sourceUrl:null,totalGraded:0,gemRate:null,grades:[],prices:[]};
+  const rows=db.prepare(`SELECT * FROM psa_population_current WHERE population_spec_pk=? ORDER BY grade_order,qualified`).all(integer(spec.psa_spec_pk)) as unknown as Row[];
+  const grouped=new Map<string,{gradeKey:string;gradeLabel:string;gradeValue:number|null;populationCount:number;qualifiedCount:number;halfGradeCount:number}>();
+  for(const row of rows){const key=String(row.grade_key),item=grouped.get(key)??{gradeKey:key,gradeLabel:String(row.grade_label??key),gradeValue:number(row.grade_value),populationCount:0,qualifiedCount:0,halfGradeCount:integer(row.half_grade_count)};if(integer(row.qualified))item.qualifiedCount+=integer(row.population_count);else item.populationCount+=integer(row.population_count);grouped.set(key,item);}
+  const total=integer(rows[0]?.total_population),gem10=grouped.get('10')?.populationCount??0;
+  const prices=db.prepare(`SELECT * FROM psa_price_current WHERE population_spec_pk=? ORDER BY grade_order`).all(integer(spec.psa_spec_pk)) as unknown as Row[];
+  return {available:true,observedAt:text(rows[0]?.observed_at),sourceUrl:text(spec.source_url),totalGraded:total,gemRate:total?gem10/total*100:null,grades:[...grouped.values()],prices:prices.map((row)=>({gradeKey:String(row.grade_key),gradeLabel:String(row.grade_label??row.grade_key),gradeValue:number(row.grade_value),mostRecentPrice:number(row.most_recent_price),averagePrice:number(row.average_price),psaPrice:number(row.psa_price)}))};
+}
+
+function rawStats(db:DatabaseSync,source:string,namespace?:string):{objects:number;bytes:number;latest:string|null}{
+  const ns=namespace?`AND sr.namespace=?`:'';const params=namespace?[source,namespace]:[source];
+  const row=db.prepare(`SELECT COUNT(*) objects,COALESCE(SUM(byte_size),0) bytes,MAX(observed_at) latest FROM(
+    SELECT DISTINCT ro.hash,ro.byte_size,o.observed_at FROM source_records sr JOIN observations o ON o.observation_id=sr.latest_observation_id JOIN raw_objects ro ON ro.hash=o.hash WHERE sr.source=? ${ns})`).get(...params) as Row;
+  return{objects:integer(row.objects),bytes:integer(row.bytes),latest:text(row.latest)};
+}
+function acquisitionRawStats(db:DatabaseSync,source:string):{objects:number;bytes:number;latest:string|null}{
+  const row=db.prepare(`SELECT COUNT(*) objects,COALESCE(SUM(byte_size),0) bytes,MAX(latest) latest FROM(
+    SELECT ro.hash,ro.byte_size,MAX(o.observed_at) latest FROM observations o JOIN work_items w ON w.work_item_id=o.work_item_id
+      JOIN raw_objects ro ON ro.hash=o.hash WHERE w.source=? GROUP BY ro.hash)`).get(source) as Row;
+  return{objects:integer(row.objects),bytes:integer(row.bytes),latest:text(row.latest)};
+}
+export function listSources(db:DatabaseSync):SourceStatus[]{
+  const tcg=db.prepare(`SELECT COUNT(*) records,SUM(CASE WHEN entity_type='card' THEN 1 ELSE 0 END) cards FROM source_records WHERE source='tcgdex'`).get() as Row;
+  const work=db.prepare(`SELECT SUM(CASE WHEN entity_type='set' AND state='succeeded' THEN 1 ELSE 0 END) indexed_count,
+    SUM(CASE WHEN entity_type='card' AND state='succeeded' THEN 1 ELSE 0 END) hydrated_count,SUM(CASE WHEN entity_type='card' AND state='pending' THEN 1 ELSE 0 END) queued_count FROM work_items WHERE source='tcgdex'`).get() as Row;
+  const tcgRaw=acquisitionRawStats(db,'tcgdex');
+  const languages=(db.prepare(`SELECT DISTINCT language FROM sets ORDER BY language`).all() as unknown as Array<{language:string}>).map(({language})=>{
+    const catalogue=db.prepare(`SELECT COUNT(*) cards,SUM(detail_status='hydrated') hydrated,
+      SUM(image_url IS NULL) missing_image,SUM(rarity IS NULL) missing_rarity,
+      SUM(json_extract(attributes_json,'$.illustrator') IS NULL) missing_illustrator
+      FROM cards WHERE set_id IN (SELECT set_id FROM sets WHERE language=?)`).get(language) as Row;
+    const sets=db.prepare(`SELECT COUNT(*) sets,SUM(total_cards>0 AND NOT EXISTS(SELECT 1 FROM cards c WHERE c.set_id=sets.set_id)) empty_sets FROM sets WHERE language=?`).get(language) as Row;
+    const images=db.prepare(`SELECT COUNT(*) jobs,SUM(state='succeeded') stored,SUM(state IN ('pending','leased','running','retryable_failed','partial')) pending
+      FROM work_items WHERE source='tcgdex' AND queue='images' AND scope_key LIKE ?`).get(`${language}:image:%`) as Row;
+    const localCards=integer((db.prepare(`SELECT COUNT(*) n FROM assets a JOIN cards c ON a.target_type='card' AND a.target_id=c.card_id
+      JOIN sets s ON s.set_id=c.set_id WHERE s.language=? AND a.object_hash IS NOT NULL`).get(language) as Row).n);
+    const localSets=integer((db.prepare(`SELECT COUNT(*) n FROM assets a JOIN sets s ON a.target_type='set' AND a.target_id=s.set_id
+      WHERE s.language=? AND a.object_hash IS NOT NULL`).get(language) as Row).n);
+    return{language,sets:integer(sets.sets),cards:integer(catalogue.cards),hydratedCards:integer(catalogue.hydrated),imageJobs:integer(images.jobs),imagesStored:integer(images.stored),imagesPending:integer(images.pending),localAssetLinks:localCards+localSets,
+      cardsWithoutImage:integer(catalogue.missing_image),cardsWithoutRarity:integer(catalogue.missing_rarity),cardsWithoutIllustrator:integer(catalogue.missing_illustrator),setsWithoutCards:integer(sets.empty_sets)};
+  });
+  const imagePending=languages.reduce((sum,item)=>sum+item.imagesPending,0);
+  const result:SourceStatus[]=[{source:'tcgdex',label:'TCGdex catalogue',latestObservation:tcgRaw.latest,sourceRecords:integer(tcg.records),matchedRecords:integer(tcg.records),unresolvedRecords:0,rawObjects:tcgRaw.objects,rawBytes:tcgRaw.bytes,openReviews:0,status:!integer(tcg.records)?'empty':integer(work.queued_count)||imagePending?'partial':'ready',indexed:integer(work.indexed_count),hydrated:integer(work.hydrated_count),queued:integer(work.queued_count),languages}];
+  for(const namespace of ['population','sales'] as const){const stat=db.prepare(`SELECT COUNT(DISTINCT sr.source_record_id) records,COUNT(DISTINCT CASE WHEN sl.match_status IN ('matched','manual') THEN sr.source_record_id END) matched FROM source_records sr LEFT JOIN source_links sl ON sl.source_record_id=sr.source_record_id WHERE sr.source='psa' AND sr.namespace=?`).get(namespace) as Row;const unresolved=integer(stat.records)-integer(stat.matched);const raw=rawStats(db,'psa',namespace);const reviews=integer((db.prepare(`SELECT COUNT(*) n FROM match_reviews mr JOIN source_records sr ON sr.source_record_id=mr.source_record_id WHERE mr.status='open' AND sr.namespace=?`).get(namespace) as Row).n);result.push({source:`psa-${namespace}`,label:namespace==='population'?'PSA population & price guide':'PSA auction sales',latestObservation:raw.latest,sourceRecords:integer(stat.records),matchedRecords:integer(stat.matched),unresolvedRecords:unresolved,rawObjects:raw.objects,rawBytes:raw.bytes,openReviews:reviews,status:!integer(stat.records)?'empty':unresolved?'partial':'ready'});}return result;
+}
+export function getFacets(db:DatabaseSync):FacetsData{
+  const values=(sql:string)=> (db.prepare(sql).all() as unknown as Array<{value:string}>).map((row)=>row.value).filter(Boolean);
+  return {languages:values(`SELECT DISTINCT language value FROM sets ORDER BY value`),sets:(db.prepare(`SELECT source_set_id id,name,language FROM sets ORDER BY language,name COLLATE NOCASE`).all() as unknown as Array<{id:string;name:string;language:string}>),categories:values(`SELECT DISTINCT category value FROM cards WHERE category IS NOT NULL ORDER BY value`),rarities:values(`SELECT DISTINCT rarity value FROM cards WHERE rarity IS NOT NULL ORDER BY value`),finishes:values(`SELECT DISTINCT finish value FROM variants WHERE finish IS NOT NULL ORDER BY value`),printRunMarkers:values(`SELECT DISTINCT print_run_marker value FROM variants WHERE print_run_marker IS NOT NULL ORDER BY value`),microVariants:values(`SELECT DISTINCT micro_variant value FROM variants WHERE micro_variant IS NOT NULL ORDER BY value`)};
+}
+export function listMatchReviews(db:DatabaseSync):MatchReviewItem[]{return (db.prepare(`SELECT mr.match_review_id,mr.issue_key,sr.source,sr.namespace,sr.source_key,mr.reason,mr.created_at FROM match_reviews mr JOIN source_records sr ON sr.source_record_id=mr.source_record_id WHERE mr.status='open' ORDER BY mr.created_at DESC LIMIT 200`).all() as unknown as Row[]).map((row)=>({matchReviewId:integer(row.match_review_id),issueKey:text(row.issue_key),source:String(row.source),namespace:String(row.namespace),sourceKey:String(row.source_key),reason:String(row.reason),createdAt:String(row.created_at)}))}
+export function getHealth(db:DatabaseSync):HealthData{const c=db.prepare(`SELECT (SELECT COUNT(*) FROM sets)sets,(SELECT COUNT(*) FROM cards)cards,(SELECT COUNT(*) FROM variants)variants,(SELECT COUNT(*) FROM psa_specs)specs,(SELECT COUNT(*) FROM psa_sales)sales`).get() as Row;const last=db.prepare(`SELECT MAX(executed_at)at FROM parser_executions WHERE parser_name='curated-materializer'`).get() as Row;const version=db.prepare(`PRAGMA user_version`).get() as Row;return{database:'ok',schemaVersion:integer(version.user_version),catalogue:{sets:integer(c.sets),cards:integer(c.cards),variants:integer(c.variants)},psa:{specs:integer(c.specs),sales:integer(c.sales)},lastMaterialization:text(last.at)}}

@@ -41,14 +41,14 @@ export function createTcgdexCatalogueCollector(deps: CatalogueDeps): Collector {
 
     if (item.entity_type === 'set') {
       const { lang, setId } = JSON.parse(item.params_json) as { lang: string; setId: string };
-      const url = `${TCGDEX_API_BASE}/${lang}/sets/${setId}`;
+      const url = `${TCGDEX_API_BASE}/${encodeURIComponent(lang)}/sets/${encodeURIComponent(setId)}`;
       const res = await fetchRaw(url);
       return handleSetResponse(lang, setId, url, res);
     }
 
     if (item.entity_type === 'card') {
       const { lang, cardId } = JSON.parse(item.params_json) as { lang: string; cardId: string };
-      const url = `${TCGDEX_API_BASE}/${lang}/cards/${cardId}`;
+      const url = `${TCGDEX_API_BASE}/${encodeURIComponent(lang)}/cards/${encodeURIComponent(cardId)}`;
       const res = await fetchRaw(url);
       return handleCardResponse(lang, cardId, url, res);
     }
@@ -183,4 +183,3 @@ function buildSetImageEnqueue(lang: string, setId: string, kind: 'logo' | 'symbo
     params: { lang, url: downloaded, allRenditions: all },
   };
 }
-

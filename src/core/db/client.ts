@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 5;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -15,6 +15,7 @@ export function openDb(dbPath: string): DatabaseSync {
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
+  db.exec('PRAGMA busy_timeout = 10000');
   migrate(db);
   return db;
 }
@@ -34,8 +35,29 @@ export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
 
 function migrate(db: DatabaseSync): void {
   const row = db.prepare('PRAGMA user_version').get() as { user_version: number };
-  if (row.user_version >= SCHEMA_VERSION) return;
-  const schemaSql = readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
-  db.exec(schemaSql);
-  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  let version = row.user_version;
+  if (version < 1) {
+    db.exec(readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 1');
+    version = 1;
+  }
+  if (version < 2) {
+    db.exec(readFileSync(path.join(__dirname, 'schema_v2.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 2');
+    version = 2;
+  }
+  if (version < 3) {
+    db.exec(readFileSync(path.join(__dirname, 'schema_v3.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 3');
+    version = 3;
+  }
+  if (version < 4) {
+    db.exec(readFileSync(path.join(__dirname, 'schema_v4.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 4');
+    version = 4;
+  }
+  if (version < 5) {
+    db.exec(readFileSync(path.join(__dirname, 'schema_v5.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 5');
+  }
 }

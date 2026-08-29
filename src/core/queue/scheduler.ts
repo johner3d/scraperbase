@@ -44,14 +44,18 @@ export interface SweepResult {
 export function sweepQueue(db: DatabaseSync, runId: string | null = null): SweepResult {
   const now = new Date().toISOString();
 
-  const expired = db
-    .prepare(`SELECT work_item_id FROM work_items WHERE state IN ('leased','running') AND lease_expires_at < ?`)
-    .all(now) as { work_item_id: string }[];
+  const leased = db.prepare(`SELECT work_item_id,lease_owner,lease_expires_at FROM work_items WHERE state IN ('leased','running')`).all() as
+    unknown as Array<{work_item_id:string;lease_owner:string|null;lease_expires_at:string|null}>;
+  const expired = leased.filter((row) => {
+    if (!row.lease_expires_at || row.lease_expires_at < now) return true;
+    const ownerRunId = row.lease_owner?.split(':').at(-1);
+    if (!ownerRunId) return true;
+    const owner = db.prepare(`SELECT status FROM runs WHERE run_id=?`).get(ownerRunId) as {status:string}|undefined;
+    return owner?.status !== 'running';
+  });
   if (expired.length > 0) {
-    db.prepare(
-      `UPDATE work_items SET state='pending', lease_owner=NULL, lease_expires_at=NULL, updated_at=?
-       WHERE state IN ('leased','running') AND lease_expires_at < ?`,
-    ).run(now, now);
+    const reset=db.prepare(`UPDATE work_items SET state='pending',lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE work_item_id=?`);
+    for(const row of expired) reset.run(now,row.work_item_id);
     for (const row of expired) {
       logEvent(db, {
         runId,
@@ -83,23 +87,38 @@ export function claimNext(
   queue: string,
   leaseOwner: string,
   leaseTtlMs: number,
+  filters: { entityTypes?: string[]; minimumPriority?: number; scopeContains?: string } = {},
 ): WorkItemRow | undefined {
   const nowIso = new Date().toISOString();
   const leaseExpiresAt = new Date(Date.now() + leaseTtlMs).toISOString();
 
+  const clauses = ['queue = ?', "state = 'pending'", 'available_at <= ?'];
+  const params: SQLInputValue[] = [queue, nowIso];
+  if (filters.entityTypes?.length) {
+    clauses.push(`entity_type IN (${filters.entityTypes.map(() => '?').join(',')})`);
+    params.push(...filters.entityTypes);
+  }
+  if (filters.minimumPriority != null) {
+    clauses.push('priority >= ?');
+    params.push(filters.minimumPriority);
+  }
+  if (filters.scopeContains) {
+    clauses.push('scope_key LIKE ?');
+    params.push(`%${filters.scopeContains.replace(/[%_\\]/g, (char) => `\\${char}`)}%`);
+  }
   return db
     .prepare(
       `UPDATE work_items
        SET state='leased', lease_owner=?, lease_expires_at=?, attempts=attempts+1, updated_at=?
        WHERE work_item_id = (
          SELECT work_item_id FROM work_items
-         WHERE queue = ? AND state = 'pending' AND available_at <= ?
+         WHERE ${clauses.join(' AND ')}
          ORDER BY priority DESC, created_at ASC
          LIMIT 1
        )
        RETURNING *`,
     )
-    .get(leaseOwner, leaseExpiresAt, nowIso, queue, nowIso) as WorkItemRow | undefined;
+    .get(leaseOwner, leaseExpiresAt, nowIso, ...params) as WorkItemRow | undefined;
 }
 
 export function heartbeat(db: DatabaseSync, id: string, leaseOwner: string, leaseTtlMs: number): void {

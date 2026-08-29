@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "scraperbase-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "web"],
+      "port": 8787,
+      "autoPort": true
+    },
+    {
+      "name": "scraperbase-web-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "web:dev"],
+      "port": 8787,
+      "autoPort": true
+    }
+  ]
+}

@@ -60,22 +60,33 @@ export async function writeObject(
   const absPath = path.join(dirs.objectsDir, relPath);
 
   const existing = db
-    .prepare('SELECT hash FROM raw_objects WHERE hash = ?')
-    .get(hash) as { hash: string } | undefined;
+    .prepare('SELECT hash, storage_path FROM raw_objects WHERE hash = ?')
+    .get(hash) as { hash: string; storage_path: string } | undefined;
 
   if (existing) {
-    await verifyExistingOrThrow(absPath, hash);
+    await verifyExistingOrThrow(path.join(dirs.objectsDir, existing.storage_path), hash);
     await rm(tmpPath, { force: true });
-    return { hash, isNew: false, storagePath: relPath, byteSize };
+    return { hash, isNew: false, storagePath: existing.storage_path, byteSize };
   }
 
   await mkdir(path.join(dirs.objectsDir, relDir), { recursive: true });
   await renameWithRetry(tmpPath, absPath);
 
-  db.prepare(
-    `INSERT INTO raw_objects (hash, media_type, byte_size, first_seen_at, storage_path, compression)
+  const inserted = db.prepare(
+    `INSERT OR IGNORE INTO raw_objects (hash, media_type, byte_size, first_seen_at, storage_path, compression)
      VALUES (?, ?, ?, ?, ?, NULL)`,
   ).run(hash, input.mediaType, byteSize, new Date().toISOString(), relPath);
+
+  if (inserted.changes === 0) {
+    const winner = db.prepare('SELECT storage_path FROM raw_objects WHERE hash = ?').get(hash) as
+      | { storage_path: string }
+      | undefined;
+    if (!winner) throw new Error(`Object store race for ${hash} completed without a canonical row`);
+    const winnerPath = path.join(dirs.objectsDir, winner.storage_path);
+    await verifyExistingOrThrow(winnerPath, hash);
+    if (winner.storage_path !== relPath) await rm(absPath, { force: true });
+    return { hash, isNew: false, storagePath: winner.storage_path, byteSize };
+  }
 
   return { hash, isNew: true, storagePath: relPath, byteSize };
 }
@@ -104,6 +115,12 @@ async function renameWithRetry(src: string, dest: string): Promise<void> {
     } catch (err) {
       lastErr = err;
       const code = (err as NodeJS.ErrnoException).code;
+      // Another worker may have atomically placed the same content first.
+      // The caller verifies the canonical hash after the database insert race.
+      if (code === 'EEXIST') {
+        await rm(src, { force: true });
+        return;
+      }
       // Transient Windows AV/indexer locks show up as EPERM/EBUSY; anything
       // else (e.g. ENOENT) is a real bug, so fail fast.
       if (code !== 'EPERM' && code !== 'EBUSY') throw err;

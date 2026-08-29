@@ -13,4 +13,5 @@ export const DATA_DIR = process.env.SCRAPERBASE_DATA_DIR
 export const DB_PATH = path.join(DATA_DIR, 'db.sqlite');
 export const OBJECTS_DIR = path.join(DATA_DIR, 'objects');
 export const OBJECTS_TMP_DIR = path.join(OBJECTS_DIR, 'tmp');
+export const MEDIA_CACHE_DIR = path.join(DATA_DIR, 'media-cache');
 export const PSA_PROFILE_DIR = path.join(DATA_DIR, 'psa-browser-profile');
