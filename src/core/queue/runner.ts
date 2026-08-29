@@ -75,7 +75,7 @@ export async function processItem(
   let isNewObject = false;
   let byteSize = result.byteSize ?? null;
   if (result.object) {
-    const written = await writeObject(db, result.object);
+    const written = await writeObject(db, result.object, result.object.dirs);
     contentHash = written.hash;
     isNewObject = written.isNew;
     byteSize = written.byteSize;

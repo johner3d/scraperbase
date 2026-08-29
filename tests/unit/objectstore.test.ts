@@ -142,3 +142,26 @@ test('writeObject lays out files under source/mediaKind/hash[0:2]/hash[2:4]/hash
     assert.deepEqual(bytes, body);
   });
 });
+
+test('writeObject honors a per-input dirs override, as runner.ts does for result.object.dirs', async () => {
+  await withTempStore(async (db, defaultDirs) => {
+    const altRoot = await mkdtemp(path.join(tmpdir(), 'scraperbase-objectstore-alt-'));
+    const altDirs: ObjectStoreDirs = {
+      objectsDir: path.join(altRoot, 'ebay-raw'),
+      objectsTmpDir: path.join(altRoot, 'ebay-raw', 'tmp'),
+    };
+    try {
+      const body = Buffer.from('{"marketplace":"de"}');
+      const input = { source: 'ebay', mediaKind: 'json' as const, mediaType: 'application/json', ext: 'json', body, dirs: altDirs };
+
+      // Mirrors processItem(): writeObject(db, result.object, result.object.dirs).
+      const result = await writeObject(db, input, input.dirs);
+
+      const bytes = await readFile(path.join(altDirs.objectsDir, result.storagePath));
+      assert.deepEqual(bytes, body);
+      await assert.rejects(() => readFile(path.join(defaultDirs.objectsDir, result.storagePath)));
+    } finally {
+      await rm(altRoot, { recursive: true, force: true });
+    }
+  });
+});

@@ -18,7 +18,21 @@ import { DEFAULT_TCGDEX_LANGUAGES } from '../../sources/tcgdex/config.ts';
 import { POKEMONCARD_IMAGES_QUEUE, seedPokemonCardDiscovery } from '../../sources/pokemoncard/discovery.ts';
 import { createPokemonCardImageCollector } from '../../sources/pokemoncard/collectors/images.ts';
 import { linkPokemonCardAssets } from '../../sources/pokemoncard/link.ts';
+import { PCGSEARCH_IMAGES_QUEUE, seedPcgSearchDiscovery } from '../../sources/pcgsearch/discovery.ts';
+import { createPcgSearchImageCollector } from '../../sources/pcgsearch/collectors/images.ts';
+import { linkPcgSearchAssets } from '../../sources/pcgsearch/link.ts';
 import { DATA_DIR } from '../../core/config/config.ts';
+import { seedEbaySearch } from '../../sources/ebay/discovery.ts';
+import { createEbaySearchCollector } from '../../sources/ebay/collectors/search.ts';
+import { createEbayItemDetailCollector } from '../../sources/ebay/collectors/itemDetail.ts';
+import {
+  DEFAULT_EBAY_MAX_ITEMS,
+  DEFAULT_EBAY_PAGE_LIMIT,
+  DEFAULT_EBAY_QUERY,
+  EBAY_MARKETPLACES,
+  type EbayMarketplaceKey,
+} from '../../sources/ebay/config.ts';
+import { printEbayRunSummary } from '../../sources/ebay/summary.ts';
 
 export type AcquisitionStage = 'index' | 'details' | 'images' | 'all';
 export type DetailPriority = 'psa' | 'all';
@@ -62,6 +76,10 @@ export async function runCommand(args: string[]): Promise<void> {
       lang: { type: 'string', default: DEFAULT_TCGDEX_LANGUAGES.join(',') },
       stage: { type: 'string', default: 'index' },
       priority: { type: 'string', default: 'psa' },
+      query: { type: 'string', default: DEFAULT_EBAY_QUERY },
+      marketplaces: { type: 'string', default: 'de,eu,international' },
+      'max-items': { type: 'string', default: String(DEFAULT_EBAY_MAX_ITEMS) },
+      limit: { type: 'string', default: String(DEFAULT_EBAY_PAGE_LIMIT) },
     },
   });
 
@@ -158,6 +176,39 @@ export async function runCommand(args: string[]): Promise<void> {
         const linked = linkPokemonCardAssets(db, new Date().toISOString());
         logEvent(db, { runId, level: 'info', category: 'system', message: `Linked ${linked} pokemon-card.com image(s) to cards` });
       }
+    } else if (opts.source === 'pcgsearch') {
+      if (opts.stage === 'images' || opts.stage === 'all') {
+        const rateLimiter = createRateLimiter({ minDelayMs: 300, jitterMs: 150 });
+        seedPcgSearchDiscovery(db);
+        await runQueue(db, {
+          queue: PCGSEARCH_IMAGES_QUEUE, collector: createPcgSearchImageCollector({ rateLimiter }),
+          concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+        });
+        const linked = linkPcgSearchAssets(db, new Date().toISOString());
+        logEvent(db, { runId, level: 'info', category: 'system', message: `Linked ${linked} PCG Search image(s) to cards` });
+      }
+    } else if (opts.source === 'ebay') {
+      const query = values.query as string;
+      const maxItems = Number(values['max-items']);
+      const limit = Number(values.limit);
+      const marketplaces = (values.marketplaces as string)
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s): s is EbayMarketplaceKey => Boolean(s) && s in EBAY_MARKETPLACES);
+      const rateLimiter = createRateLimiter({ minDelayMs: 250, jitterMs: 150 });
+
+      for (const marketplace of marketplaces) {
+        seedEbaySearch(db, { marketplace, query, limit, maxItems });
+        await runQueue(db, {
+          queue: 'ebay_search', collector: createEbaySearchCollector({ rateLimiter }),
+          concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+        });
+        await runQueue(db, {
+          queue: 'ebay_item_detail', collector: createEbayItemDetailCollector({ rateLimiter }),
+          concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+        });
+      }
+      printEbayRunSummary(db, runId);
     } else {
       console.error(`Source '${opts.source}' is not implemented yet (PSA arrives in Phase 3).`);
       process.exitCode = 1;

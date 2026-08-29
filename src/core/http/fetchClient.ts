@@ -10,9 +10,9 @@ export interface RawFetchResult {
 // provenance and change-detection are recorded.
 const ALLOWED_RESPONSE_HEADERS = ['content-type', 'content-length', 'last-modified', 'etag'];
 
-export async function fetchRaw(url: string): Promise<RawFetchResult> {
+export async function fetchRaw(url: string, requestHeaders: Record<string, string> = {}): Promise<RawFetchResult> {
   const start = Date.now();
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: requestHeaders });
   const body = Buffer.from(await res.arrayBuffer());
   const headers: Record<string, string> = {};
   for (const key of ALLOWED_RESPONSE_HEADERS) {

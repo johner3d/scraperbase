@@ -13,6 +13,8 @@ export interface WriteObjectInput {
   mediaType: string;    // e.g. 'application/json', 'image/webp'
   ext: string;           // e.g. 'json', 'html', 'webp'
   body: Buffer;
+  /** Overrides where this object is stored -- e.g. eBay's data/ebay-raw/ tree instead of the shared data/objects/. */
+  dirs?: ObjectStoreDirs;
 }
 
 export interface WriteObjectResult {

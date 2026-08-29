@@ -1,4 +1,4 @@
-import { POKEMONCARD_DETAIL_BASE, POKEMONCARD_EX_BASE, POKEMONCARD_SEARCH_API, pokemonCardGetJson, pokemonCardGetText } from './config.ts';
+import { POKEMONCARD_DETAIL_BASE, POKEMONCARD_SEARCH_API, pokemonCardGetJson, pokemonCardGetText } from './config.ts';
 
 export interface CardLookupInput {
   name: string;
@@ -54,10 +54,32 @@ function stripHtml(html: string): string[] {
     .split('\n').map((line) => line.trim()).filter(Boolean);
 }
 
-async function printedNumber(cardID: string): Promise<string | null> {
+const detailCache = new Map<string, string>();
+async function fetchDetailHtml(cardID: string): Promise<string> {
+  const cached = detailCache.get(cardID);
+  if (cached !== undefined) return cached;
   const { text } = await pokemonCardGetText(`${POKEMONCARD_DETAIL_BASE}/${cardID}/regulation/all`);
-  const numLine = stripHtml(text).find((line) => /^\d{3}\s*\/\s*\d+/.test(line));
+  detailCache.set(cardID, text);
+  return text;
+}
+
+async function printedNumber(cardID: string): Promise<string | null> {
+  const numLine = stripHtml(await fetchDetailHtml(cardID)).find((line) => /^\d{3}\s*\/\s*\d+/.test(line));
   return numLine ? numLine.split('/')[0]!.trim() : null;
+}
+
+/**
+ * Every card detail page links to its boxed product with anchor text
+ * "{category label}「{core product name}」" (e.g. ハイクラスパック「GXウルトラ
+ * シャイニー」). The product's own URL varies by era -- older Sun & Moon-era
+ * products live at /products/{series}/{code}.html, newer ones at /ex/{code}/
+ * -- so reading the anchor TEXT directly off any candidate's own detail page
+ * sidesteps guessing which URL scheme applies (guessing /ex/ for an old-era
+ * product just 404s and looks like "no boxed product exists").
+ */
+async function productNameFromDetail(cardID: string): Promise<string | null> {
+  const anchor = /<a[^>]*href="[^"]*"[^>]*>([^<]*「[^」]+」[^<]*)<\/a>/.exec(await fetchDetailHtml(cardID));
+  return anchor?.[1]?.trim() ?? null;
 }
 
 function normalizeSetName(value: string): string {
@@ -81,19 +103,6 @@ function setNameMatches(pageTitle: string | null, ourSetName: string): boolean {
   const p = normalizeSetName(coreTitle(pageTitle));
   const o = normalizeSetName(ourSetName);
   return p === o || p.includes(o) || o.includes(p);
-}
-
-const exTitleCache = new Map<string, string | null>();
-async function exPageTitle(folder: string): Promise<string | null> {
-  const cached = exTitleCache.get(folder);
-  if (cached !== undefined) return cached;
-  let title: string | null = null;
-  try {
-    const { status, text } = await pokemonCardGetText(`${POKEMONCARD_EX_BASE}/${folder.toLowerCase()}/`);
-    if (status === 200) title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(text)?.[1]?.trim() ?? null;
-  } catch { /* promo/loose-card folders have no boxed-product page */ }
-  exTitleCache.set(folder, title);
-  return title;
 }
 
 /** set_name -> resolved site folder, cached across an entire run so only the first card of each TCGdex set pays the discovery cost. */
@@ -137,8 +146,9 @@ export async function matchCardImage(input: CardLookupInput): Promise<CardImageM
 
   for (const folder of new Set(candidates.map((c) => c.folder))) {
     if (folder === cachedFolder) continue;
-    const title = await exPageTitle(folder);
-    if (!setNameMatches(title, input.setName)) continue;
+    const representative = candidates.find((c) => c.folder === folder)!;
+    const productName = await productNameFromDetail(representative.cardID);
+    if (!setNameMatches(productName, input.setName)) continue;
     setFolderCache.set(input.setName, folder);
     const hit = await resolveWithinFolder(candidates, folder, input.localId, 'discovered-folder');
     if (hit) return hit;
