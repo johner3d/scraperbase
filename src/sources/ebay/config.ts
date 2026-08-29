@@ -33,9 +33,10 @@ export const EBAY_MARKETPLACES: Record<EbayMarketplaceKey, EbayMarketplaceDef> =
 
 export const DEFAULT_EBAY_QUERY = 'pikachu psa 10';
 export const DEFAULT_EBAY_PAGE_LIMIT = 200;
-// Zero means uncapped. Raw acquisition should be complete by default; callers
-// must opt into a safety cap explicitly (for example during a smoke test).
+// Zero removes our own cap by default; eBay's 10,000-result API window still
+// applies and is detected separately. Positive caps are for smoke tests.
 export const DEFAULT_EBAY_MAX_ITEMS = 0;
+export const EBAY_ALL_BUYING_OPTIONS = ['AUCTION', 'FIXED_PRICE', 'BEST_OFFER', 'CLASSIFIED_AD'] as const;
 
 const EBAY_ENV_FILE = path.join(PROJECT_ROOT, 'ibbi', '.env');
 

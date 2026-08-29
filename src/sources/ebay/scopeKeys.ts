@@ -6,7 +6,7 @@ export function searchPageScopeKey(
   maxItems: number,
 ): string {
   const cap = maxItems === 0 ? 'all' : String(maxItems);
-  return `search:${marketplace}:${query}:limit=${limit}:max=${cap}:offset=${offset}`;
+  return `search:${marketplace}:${query}:buying=all:limit=${limit}:max=${cap}:offset=${offset}`;
 }
 
 // Query-independent but marketplace-specific: a repeated hit within one

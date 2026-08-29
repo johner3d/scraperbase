@@ -14,7 +14,7 @@ export async function refreshCommand(args: string[]): Promise<void> {
   if (!selected) throw new Error(`Invalid --stage ${values.stage}`);
   const db = openCliDb();
   try {
-    const clauses = [`source=?`, `queue IN (${selected.map(() => '?').join(',')})`];
+    const clauses = [`source=?`, `queue IN (${selected.map(() => '?').join(',')})`, `state <> 'cancelled'`];
     const params: Array<string> = [String(values.source), ...selected];
     if (values.stage === 'index') clauses.push(`entity_type IN ('lang_set_list','set')`);
     if (values.stage === 'details') clauses.push(`entity_type='card'`);

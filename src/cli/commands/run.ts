@@ -77,7 +77,9 @@ export async function runCommand(args: string[]): Promise<void> {
       stage: { type: 'string', default: 'index' },
       priority: { type: 'string', default: 'psa' },
       query: { type: 'string', default: DEFAULT_EBAY_QUERY },
-      marketplaces: { type: 'string', default: 'de,eu,international' },
+      // DE is the only currently live-verified complete scope. EU needs a
+      // separate quota window; international also needs >10k partitioning.
+      marketplaces: { type: 'string', default: 'de' },
       'max-items': { type: 'string', default: String(DEFAULT_EBAY_MAX_ITEMS) },
       limit: { type: 'string', default: String(DEFAULT_EBAY_PAGE_LIMIT) },
     },
@@ -202,6 +204,9 @@ export async function runCommand(args: string[]): Promise<void> {
       if (!query.trim()) throw new Error('--query must not be empty');
       if (!Number.isInteger(maxItems) || maxItems < 0) throw new Error('--max-items must be a non-negative integer (0 means uncapped)');
       if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('--limit must be an integer from 1 to 200');
+      if (maxItems > limit && maxItems % limit !== 0) {
+        throw new Error('--max-items must be a multiple of --limit when it spans more than one page');
+      }
       const rateLimiter = createRateLimiter({ minDelayMs: 250, jitterMs: 150 });
 
       for (const marketplace of marketplaces) {

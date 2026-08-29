@@ -10,13 +10,26 @@ explicit instruction -- this is acquisition only. See
 `docs/psa-raw-fetch.md` for the sibling PSA effort and its own notes on the
 raw-first philosophy.
 
-**Status as of this writing: implemented, typechecked, and unit-tested, but
-NOT yet verified against the live eBay API end-to-end** -- a concurrent
-exclusive `pokemoncard` run held the single-writer lock (see "What to look
-out for" below) and the live smoke test was still pending when this doc was
-written. **Whoever picks this up next should run the smoke test in
-"Verifying it works" before trusting any of this in a real acquisition run,
-and update this doc's status line once it's done.**
+**Status: live smoke-verified against the production eBay API on 2026-08-29.**
+The DE smoke fetched one search page plus five item-detail records (6/6 HTTP
+200, 84,531 raw bytes). EU and international one-result probes also succeeded.
+The subsequent default-view DE run completed with 25 search pages, 4,691 unique
+observed item IDs, and 4,711/4,711 successful calls (4,686 new details plus
+the 25 pages; the five smoke details were reused), totaling 77,891,316 bytes.
+An official-doc audit then confirmed that eBay's default view omits live
+auction-only listings after a bid. Search requests now explicitly OR all four
+buying options (`AUCTION`, `FIXED_PRICE`, `BEST_OFFER`, `CLASSIFIED_AD`) and
+use new `buying=all` scope keys. The corrected DE pages returned 4,976 rows
+(4,925 unique within that moving pass), including 150 rows advertising an
+`AUCTION` option and 284 IDs not seen in the default-view pass. It stored all
+25 pages and 245 additional item details before the daily quota closed; 39
+detail items remain durably pending for the 2026-08-30 07:00 UTC reset. The
+completed default-view pass remains valid raw history rather than being
+overwritten.
+International is not yet completeness-capable: its live result count was
+47,596, while eBay exposes at most 10,000 items from one search result set.
+The collector marks that condition as an explicit failure instead of silently
+claiming a complete import; category/price partitioning is still required.
 
 ## Why this exists
 
@@ -76,17 +89,17 @@ Two-stage pipeline, mirroring `src/sources/tcgdex/discovery.ts` +
 1. **Search pages** (`src/sources/ebay/collectors/search.ts`, queue
    `ebay_search`, entity_type `search_page`) --
    `GET /buy/browse/v1/item_summary/search?q=<query>&limit=<limit>&offset=<offset>[&filter=itemLocationCountry:{...}]`.
-   No `buyingOptions` filter -- confirmed with the user to capture **every**
-   listing type (auction, fixed-price, best-offer), not just auctions,
-   despite "auction fetcher" being this feature's working name. Stores the
+   An explicit OR filter includes all four documented buying options
+   (`AUCTION`, `FIXED_PRICE`, `BEST_OFFER`, `CLASSIFIED_AD`), because eBay's
+   unfiltered default omits live auction-only listings after a bid. Stores the
    entire raw response verbatim (item summaries, `total`, pagination
    metadata, everything). Parses just enough to:
-   - enqueue one `ebay_item_detail` work item per `itemId` found (scope key
-     is marketplace/query-independent, so the same listing found by two
-     different searches -- or on two marketplaces -- is only ever
-     detail-fetched once), and
-   - enqueue the next page (`offset += limit`) if `offset+limit < total`
-     **and** still under the configured `--max-items` cap.
+   - enqueue one `ebay_item_detail` work item per `itemId` found (scope keys
+     are query-independent but marketplace-specific, preserving potentially
+     different marketplace views while deduplicating repeat hits within a
+     marketplace), and
+   - enqueue the offset from eBay's `next` link, rather than trusting `total`
+     for pagination, while still respecting an explicit `--max-items` cap.
 2. **Item detail** (`src/sources/ebay/collectors/itemDetail.ts`, queue
    `ebay_item_detail`, entity_type `item`) -- `GET /buy/browse/v1/item/<itemId>`.
    Confirmed with the user to always run (not optional) despite multiplying
@@ -96,8 +109,15 @@ Two-stage pipeline, mirroring `src/sources/tcgdex/discovery.ts` +
    Leaf node, no further fan-out.
 
 Both collectors follow the same success/failure/`schema_drift` shape as
-every other collector in this codebase (`classifyHttpStatus`, always store
-the bytes even on a parse failure so nothing observed is ever lost).
+every other collector in this codebase (`classifyHttpStatus`). Successful,
+schema-drift, and non-2xx response bodies are all stored, so API error payloads
+are retained too. A live attempt to use eBay's quota-efficient 20-item
+`getItems` endpoint returned HTTP 403 for this App ID, and a token request for
+the required `buy.item.bulk` scope was rejected as `invalid_scope`; production
+discovery therefore continues to use permitted one-item calls.
+The failed bulk probe remains in the append-only attempt/observation history,
+but its invalid work item is cancelled and `refresh` deliberately leaves
+cancelled work alone.
 
 ## Where it's stored, and why that's also the history mechanism
 
@@ -150,17 +170,18 @@ node src/cli/index.ts refresh --source ebay --stage all
 node src/cli/index.ts run --source ebay --marketplaces de,eu,international --query "pikachu psa 10"
 ```
 
-Item-detail work items are shared across every search/marketplace (scope key
-is just `item:<itemId>`), so `refresh --stage detail` resets *all* known
-items regardless of which search originally found them.
+Item-detail work items are shared across searches within a marketplace (scope
+key is `item:<marketplace>:<itemId>`). `refresh --stage detail` resets *all*
+known item observations across marketplaces regardless of which search found
+them.
 
 ## Files
 
 | File | What it does |
 |---|---|
-| `src/sources/ebay/config.ts` | `EBAY_MARKETPLACES`, `EBAY_RAW_DIRS`, API base URLs, `loadEbayCredentials()`, defaults (`DEFAULT_EBAY_QUERY = "pikachu psa 10"`, `DEFAULT_EBAY_PAGE_LIMIT = 200`, `DEFAULT_EBAY_MAX_ITEMS = 1000`). |
+| `src/sources/ebay/config.ts` | `EBAY_MARKETPLACES`, `EBAY_RAW_DIRS`, API base URLs, `loadEbayCredentials()`, defaults (`DEFAULT_EBAY_QUERY = "pikachu psa 10"`, `DEFAULT_EBAY_PAGE_LIMIT = 200`, `DEFAULT_EBAY_MAX_ITEMS = 0`, meaning uncapped). |
 | `src/sources/ebay/auth.ts` | `getEbayAccessToken()` -- cached OAuth2 client-credentials token. |
-| `src/sources/ebay/scopeKeys.ts` | `searchPageScopeKey(marketplace, query, offset)`, `itemScopeKey(itemId)` (marketplace/query-independent by design). |
+| `src/sources/ebay/scopeKeys.ts` | Search keys include marketplace, query, page size, cap, and offset; item keys include marketplace and item ID. This keeps smoke/full configurations separate and preserves marketplace-specific observations. |
 | `src/sources/ebay/discovery.ts` | `seedEbaySearch(db, { marketplace, query, limit, maxItems })` -- enqueues the offset-0 search page. |
 | `src/sources/ebay/collectors/search.ts` | `createEbaySearchCollector(deps)` -- fetches one search page, fans out item-detail jobs + the next page. |
 | `src/sources/ebay/collectors/itemDetail.ts` | `createEbayItemDetailCollector(deps)` -- fetches one item's full detail record. |
@@ -174,8 +195,11 @@ items regardless of which search originally found them.
 ## Usage
 
 ```bash
-# Full run across all three marketplaces, default query, default caps
+# Uncapped DE run (the safe default and the live-verified scope)
 node src/cli/index.ts run --source ebay
+
+# Other scopes must be named explicitly; budget each into its own quota window
+node src/cli/index.ts run --source ebay --marketplaces eu --query "pikachu psa 10"
 
 # One marketplace, small cap, tighter concurrency (for testing/inspection)
 node src/cli/index.ts run --source ebay --marketplaces de --query "pikachu psa 10" --max-items 60 --limit 30 --concurrency 3
@@ -198,7 +222,8 @@ run is stale without checking its heartbeat recency first.
 
 ## Verifying it works
 
-Not yet run against the live API as of this doc. To smoke-test:
+The following smoke test was run successfully against the live API on
+2026-08-29:
 
 ```bash
 npm run typecheck
@@ -220,13 +245,12 @@ actually changed).
 
 No parsing of item fields into structured tables, no matching to the
 curated card catalogue (`source_records`/`source_links`/`assets` from
-`schema_v2.sql`), no coverage-table usage (eBay's `total` can run into the
-thousands and search results are inherently unstable between requests, so
-"complete" coverage isn't really a meaningful state the way it is for a
-static catalogue), no rate-limit tuning beyond a conservative hardcoded
-default (`minDelayMs: 250, jitterMs: 150`, shared across both queues -- eBay
-Browse API's actual allowance is likely much higher; this hasn't been
-pushed or measured against real quota limits yet).
+`schema_v2.sql`), and no category/price partition coverage layer yet for
+queries above eBay's 10,000-result window. Search pages move while they are
+being read, so exhaustive discovery will also need repeat-pass convergence
+based on newly observed item IDs. Request spacing remains conservative
+(`minDelayMs: 250, jitterMs: 150`, shared across both queues); the measured
+constraint for this App ID is the 5,000-call daily quota, not a burst limit.
 
 ## What to look out for
 
@@ -238,19 +262,35 @@ holding ~6900 pending items blocked the first eBay smoke test). Check
 actually dead -- `createRun` only auto-cancels rows whose heartbeat is >2
 minutes stale.
 
-**`--max-items` is a hard safety cap, not a target.** eBay's `total` for
-"pikachu psa 10" internationally was over 3000 in ad hoc testing; the
-default cap (1000 per marketplace per query) will not capture everything.
-Raise it (or drop it -- unclear if the collector currently supports
-"uncapped"; check `search.ts`'s `nextOffset < params.maxItems` condition
-before assuming `--max-items 0` means unlimited, it doesn't as written) once
-real rate-limit headroom is confirmed.
+**`--max-items 0` means uncapped and is the default.** A positive value is an
+explicit smoke-test/safety cap. If it spans more than one page it must be a
+multiple of `--limit`, because eBay requires each offset to be a multiple of
+the page limit. Search work scope keys include the limit and cap, so a capped
+smoke test cannot prevent a later uncapped seed from running.
+
+**One eBay search result set cannot expose more than 10,000 items.** The live
+international probe reported 47,596 matches for this one term. The collector
+records the root page and marks it `schema_drift`/`permanent_failed` with a
+clear message when an uncapped query exceeds that window. Do not call a run
+"complete" until category/price partitioning has been implemented and its
+union/dedup coverage verified.
 
 **Item-detail fetching multiplies API calls roughly 1:1 with items found.**
-A `--max-items 1000` run across three marketplaces could mean on the order
-of thousands of item-detail calls on top of the search-page calls
-themselves, even accounting for the cross-marketplace item-id dedup. Watch
-eBay's daily Browse API call quota if running this at full scope repeatedly.
+The production App ID reported a 5,000-call daily `buy.browse` limit via
+Developer Analytics on 2026-08-29. The corrected all-buying-options DE pass
+used the remaining allowance; 26 HTTP 429 bodies were retained and their work
+was requeued, leaving 39 DE details pending for the next reset. The separate
+5,000-call bulk pool cannot currently be used because `getItems` returned HTTP 403
+"Insufficient permissions". Complete acquisition therefore has to resume
+across quota reset windows (or the App ID needs bulk access / a higher limit).
+
+**Search `total` is approximate and the result set moves during pagination.**
+The DE headline count was about 4,814, but 25 live pages yielded 4,691 unique
+item IDs because listings can shift and repeat while offset pages are being
+read. Nothing returned by the API was filtered out: every page is stored and
+every unique observed ID gets detail work. An iterative refresh/convergence
+pass is still needed if "everything" means exhaustive discovery rather than
+"retain everything eBay returned in this pass."
 
 **eBay's Browse API `q` search is loose.** Ad hoc testing showed
 "PSA 10 Pikachu" results including sequential-card lots, stamp boxes, and
