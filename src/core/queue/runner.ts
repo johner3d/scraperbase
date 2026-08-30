@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { withTransaction } from '../db/client.ts';
 import { writeObject, type WriteObjectInput } from '../objectstore/store.ts';
 import { bumpCounter } from '../progress/metrics.ts';
+import { logEvent } from '../events/eventLog.ts';
 import {
   claimNext,
   enqueueWorkItem,
@@ -57,7 +58,7 @@ export async function processItem(
   item: WorkItemRow,
   collector: Collector,
   ctx: CollectorContext,
-): Promise<void> {
+): Promise<CollectorOutcome> {
   const startedAt = new Date().toISOString();
   let result: CollectorOutcome;
   try {
@@ -153,6 +154,8 @@ export async function processItem(
     if (item.attempts > 1) bumpCounter(db, ctx.runId, 'retries_total');
     if (result.httpStatus) bumpCounter(db, ctx.runId, `http_status_${Math.floor(result.httpStatus / 100)}xx`);
   });
+
+  return result;
 }
 
 export interface RunQueueOptions {
@@ -166,7 +169,18 @@ export interface RunQueueOptions {
   entityTypes?: string[];
   minimumPriority?: number;
   scopeContains?: string;
+  /**
+   * Safety valve, not a guarantee: after this many consecutive non-success
+   * outcomes across the whole queue (any worker), pause `cooldownMs` before
+   * claiming more work rather than hammering a rate-limited or re-challenging
+   * upstream site. Ports `psa-fetch.ts`'s `maybeCooldown` into the generic
+   * runner so every collector can opt in, not just the legacy PSA scripts.
+   * Undefined (the default) preserves old behavior: no pause, ever.
+   */
+  cooldown?: { afterConsecutiveFailures: number; cooldownMs: number };
 }
+
+const SUCCESS_FINAL_STATES: ReadonlySet<CollectorOutcome['final']> = new Set(['succeeded', 'partial']);
 
 /**
  * Drives one queue to exhaustion with a small worker pool. Exits once no
@@ -181,6 +195,7 @@ export async function runQueue(db: DatabaseSync, opts: RunQueueOptions): Promise
   sweepQueue(db, opts.runId);
   const pollMs = opts.pollIntervalMs ?? 100;
   let activeCount = 0;
+  let consecutiveFailures = 0;
 
   async function worker(): Promise<void> {
     while (!opts.isDraining()) {
@@ -197,7 +212,24 @@ export async function runQueue(db: DatabaseSync, opts: RunQueueOptions): Promise
       }
       activeCount++;
       try {
-        await processItem(db, item, opts.collector, { runId: opts.runId });
+        const result = await processItem(db, item, opts.collector, { runId: opts.runId });
+        if (opts.cooldown) {
+          if (SUCCESS_FINAL_STATES.has(result.final)) {
+            consecutiveFailures = 0;
+          } else {
+            consecutiveFailures++;
+            if (consecutiveFailures >= opts.cooldown.afterConsecutiveFailures) {
+              logEvent(db, {
+                runId: opts.runId,
+                level: 'warn',
+                category: 'system',
+                message: `${consecutiveFailures} consecutive failures on queue '${opts.queue}' -- cooling down for ${opts.cooldown.cooldownMs}ms before continuing`,
+              });
+              await sleep(opts.cooldown.cooldownMs);
+              consecutiveFailures = 0;
+            }
+          }
+        }
       } finally {
         activeCount--;
       }

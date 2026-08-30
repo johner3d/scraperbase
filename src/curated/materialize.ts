@@ -4,6 +4,14 @@ import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { DATA_DIR } from '../core/config/config.ts';
 import { readObject, type ObjectStoreDirs } from '../core/objectstore/store.ts';
+import { EBAY_RAW_DIRS } from '../sources/ebay/config.ts';
+import {
+  extractGrading, extractCardIdentity, findCandidateVariants, isLot, isPsa10,
+  type CardIdentity, type EbayItemDetail, type GradingInfo, type VariantCandidate,
+} from './ebayMatch.ts';
+import { matchPsaCardRow, type PsaSetItemRow } from './psaCardMatch.ts';
+import { autoMatchAllHeadings } from './psaSetMatch.ts';
+import { popSetItemsScopeKey } from '../sources/psa/scopeKeys.ts';
 
 export const CURATED_PARSER_NAME = 'curated-materializer';
 export const CURATED_PARSER_VERSION = '6';
@@ -11,8 +19,10 @@ export const CURATED_PARSER_VERSION = '6';
 export interface MaterializeOptions {
   psaDir?: string;
   objectStoreDirs?: ObjectStoreDirs;
+  ebayDirs?: ObjectStoreDirs;
   includeTcgdex?: boolean;
   includePsa?: boolean;
+  includeEbay?: boolean;
   now?: string;
 }
 
@@ -29,6 +39,9 @@ export interface MaterializeResult {
   censusRows: number;
   salesRows: number;
   matchedPsaSpecs: number;
+  ebayListings: number;
+  matchedEbayListings: number;
+  ebayPriceObservations: number;
   openReviews: number;
 }
 
@@ -151,7 +164,7 @@ function valueText(value: unknown, fallback = ''): string {
 }
 function nullableText(value: unknown): string | null { return valueText(value) || null }
 function json(value: unknown): string { return JSON.stringify(value ?? {}) }
-function normalizePart(value: unknown): string {
+export function normalizePart(value: unknown): string {
   return valueText(value).normalize('NFKD').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 }
 function normalizedStamps(values: unknown[] | undefined): string[] {
@@ -621,7 +634,7 @@ function upsertSales(db:DatabaseSync,data:SalesFile,specPk:number,observation:Ob
   }
   return count;
 }
-async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omit<MaterializeResult,'sets'|'cards'|'hydratedCards'|'variants'|'assets'|'localAssetsLinked'|'openReviews'>>{
+async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omit<MaterializeResult,'sets'|'cards'|'hydratedCards'|'variants'|'assets'|'localAssetsLinked'|'openReviews'|'ebayListings'|'matchedEbayListings'|'ebayPriceObservations'>>{
   const populations=latestFiles<PopulationFile>(root,'population',(data)=>String(data.psaSpecId));
   const sales=latestFiles<SalesFile>(root,'sales',(data)=>String(data.salesSpecId));
   db.prepare(`DELETE FROM match_reviews WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa') AND status='open'`).run();
@@ -657,13 +670,208 @@ async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omi
   return{psaSpecs,populationRows,priceRows,censusRows,salesRows,matchedPsaSpecs};
 }
 
+function writeNativePopulationCounts(db:DatabaseSync,specPk:number,row:PsaSetItemRow,observedAt:string,observationId:number|null):number{
+  const total=Number(row.GradeTotal??0)+Number(row.HalfGradeTotal??0)+Number(row.QualifiedGradeTotal??0);
+  db.prepare(`DELETE FROM psa_population_current WHERE population_spec_pk=?`).run(specPk);
+  let rows=0;
+  for(const grade of DISPLAY_GRADES){
+    db.prepare(`INSERT INTO psa_population_current
+      (population_spec_pk,grade_key,grade_value,qualified,population_count,total_population,half_grade_total,qualified_total,
+        observed_at,observation_id,grade_label,grade_order,half_grade_count)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(specPk,grade.key,grade.value,0,grade.base?Number(row[grade.base]??0):0,total,
+        Number(row.HalfGradeTotal??0),Number(row.QualifiedGradeTotal??0),observedAt,observationId,grade.label,grade.order,
+        grade.half?Number(row[grade.half]??0):0);
+    rows++;
+    if(grade.qualified&&Number(row[grade.qualified]??0)>0){
+      db.prepare(`INSERT INTO psa_population_current
+        (population_spec_pk,grade_key,grade_value,qualified,population_count,total_population,half_grade_total,qualified_total,
+          observed_at,observation_id,grade_label,grade_order,half_grade_count)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)`).run(specPk,grade.key,grade.value,1,Number(row[grade.qualified]??0),total,
+          Number(row.HalfGradeTotal??0),Number(row.QualifiedGradeTotal??0),observedAt,observationId,grade.label,grade.order);
+      rows++;
+    }
+  }
+  return rows;
+}
+
+interface PsaSetItemsFile { headingId:string; name?:string; fetchedAt:string; data?:PsaSetItemRow[] }
+
+/**
+ * Native PSA population materialization: reads GetSetItems payloads
+ * discovered by the psa_pop_discovery/psa_pop_set_items queues (see
+ * src/sources/psa/collectors/{popDiscovery,setItems}.ts), auto-matches any
+ * newly-discovered headings to tcgdex sets (psaSetMatch.ts), then matches
+ * each card row to a tcgdex card+variant (psaCardMatch.ts) and writes
+ * population counts. Zero dependency on the old selection-file snapshot.
+ */
+async function materializePsaNative(db:DatabaseSync,at:string,dirs?:ObjectStoreDirs):Promise<{psaSpecs:number;populationRows:number;matchedPsaSpecs:number}>{
+  autoMatchAllHeadings(db,at);
+  const headings=db.prepare(`SELECT psa_heading_id,source_set_id,language,match_status FROM psa_set_map
+    WHERE source_set_id IS NOT NULL AND match_status IN ('matched','manual')`)
+    .all() as unknown as Array<{psa_heading_id:number;source_set_id:string;language:string;match_status:'matched'|'manual'}>;
+
+  let psaSpecs=0,populationRows=0,matchedPsaSpecs=0;
+  for(const heading of headings){
+    const observation=latestObservation(db,'pop_set_items',popSetItemsScopeKey(String(heading.psa_heading_id)));
+    if(!observation)continue;
+    let file:{data?:PsaSetItemRow[]};
+    try{
+      file=await readObservationJson<{data?:PsaSetItemRow[]}>(observation,dirs);
+    }catch(error){
+      // The collector already guards against unparseable GetSetItems bodies
+      // (marks them schema_drift/permanent_failed), but PSA can still return
+      // HTTP 200 with an app-shell "not found" HTML page for a heading ID
+      // that no longer resolves -- confirmed live 2026-08-29 for 5 of 1848
+      // headings. That still writes a raw object + observation (the generic
+      // processItem() record-everything path), so it's still "the latest
+      // observation" here even though the work item itself is not
+      // 'succeeded'. One bad heading must not abort materializing the other
+      // 1843 -- skip it and keep going.
+      console.warn(`Skipping PSA heading ${heading.psa_heading_id}: observation ${observation.observation_id} is not valid GetSetItems JSON (${error instanceof Error?error.message:String(error)})`);
+      continue;
+    }
+    const rows=(file.data??[]).filter((row)=>row.CardNumber!=null);
+    let headingMatched=0;
+    for(const row of rows){
+      const match=matchPsaCardRow(db,heading.source_set_id,heading.language,row);
+      if(match.status==='skipped')continue;
+      const sourceKey=String(row.SpecID);
+      const recordId=upsertSourceRecord(db,{source:'psa',namespace:'population',sourceKey,entityType:'population',
+        language:heading.language,observation,observedAt:at});
+      let variantId:number|null=null;
+      if(match.status==='matched'&&match.cardId!=null&&match.variantParts){
+        variantId=upsertVariant(db,{cardId:match.cardId,parts:match.variantParts,sourceRecordId:recordId,at,identity:'inferred',
+          attributes:{evidence:'psa-pop-report',specId:row.SpecID}});
+        linkSource(db,recordId,'variant',variantId,'matched','psa-pop-report',at);
+        matchedPsaSpecs++;headingMatched++;
+      } else {
+        recordIssueReview(db,recordId,{sourceCardId:`${heading.source_set_id}-${row.CardNumber}`,finish:'',printRunMarker:''},at,
+          match.reason??'PSA pop-report row did not match a unique tcgdex card');
+      }
+      const specPk=upsertPsaSpec(db,'population',{
+        release:heading.source_set_id,sourceCardId:`${heading.source_set_id}-${row.CardNumber}`,
+        finish:match.variantParts?.finish??'',printRunMarker:match.variantParts?.printRunMarker??'',
+        microVariant:match.variantParts?.microVariant,psaSpecId:row.SpecID,
+        popSourceUrl:`https://www.psacard.com/spec/psa/${row.SpecID}`,salesSpecId:row.SpecID,fetchedAt:at,populationRaw:'{}',
+      },recordId,variantId,match.status==='matched'?'matched':'unmatched');
+      populationRows+=writeNativePopulationCounts(db,specPk,row,at,observation.observation_id);
+      psaSpecs++;
+    }
+    recordParser(db,observation,at,{kind:'pop-set-items',headingId:heading.psa_heading_id,rows:rows.length,matched:headingMatched});
+  }
+  return{psaSpecs,populationRows,matchedPsaSpecs};
+}
+
+function ebayPriceFingerprint(args:{priceValue:number|null;priceCurrency:string|null;buyingOptions:string[];currentBidPrice:number|null;bidCount:number|null;itemEndDate:string|null}):string{
+  return createHash('sha256').update([args.priceValue??'',args.priceCurrency??'',args.buyingOptions.join(','),args.currentBidPrice??'',args.bidCount??'',args.itemEndDate??''].join('|')).digest('hex');
+}
+function insertEbayPriceObservation(db:DatabaseSync,listingId:number,item:EbayItemDetail,observation:ObservationRow|null,at:string):boolean{
+  const priceValue=item.price?.value!=null?Number(item.price.value):null;
+  const priceCurrency=item.price?.currency??null;
+  const buyingOptions=item.buyingOptions??[];
+  const currentBidPrice=item.currentBidPrice?.value!=null?Number(item.currentBidPrice.value):null;
+  const bidCount=item.bidCount??null;
+  const itemEndDate=item.itemEndDate??null;
+  const fp=ebayPriceFingerprint({priceValue,priceCurrency,buyingOptions,currentBidPrice,bidCount,itemEndDate});
+  const result=db.prepare(`INSERT OR IGNORE INTO ebay_listing_price_observations
+    (ebay_listing_id,observation_id,observed_at,price_value,price_currency,buying_options_json,current_bid_price,bid_count,item_end_date,snapshot_fingerprint)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(listingId,observation?.observation_id??null,at,priceValue,priceCurrency,json(buyingOptions),currentBidPrice,bidCount,itemEndDate,fp);
+  return result.changes>0;
+}
+function recordEbayReview(db:DatabaseSync,sourceRecordId:number,at:string,reason:string,candidates:VariantCandidate[]):void{
+  const exists=db.prepare(`SELECT 1 FROM match_reviews WHERE source_record_id=? AND target_type='variant' AND status='open'`).get(sourceRecordId);
+  if(exists) return;
+  db.prepare(`INSERT INTO match_reviews(source_record_id,target_type,candidate_target_id,reason,candidates_json,status,created_at)
+    VALUES(?,'variant',?,?,?,'open',?)`).run(sourceRecordId,candidates[0]?.variantId??null,reason,json(candidates.map((c)=>c.variantId)),at);
+}
+function resolveEbayVariant(db:DatabaseSync,sourceRecordId:number,identity:CardIdentity,at:string):{variantId:number|null;status:'matched'|'ambiguous'|'unmatched'|'manual';method:string;confidence:number|null}{
+  const override=db.prepare(`SELECT target_id FROM match_overrides WHERE source_record_id=? AND target_type='variant' AND active=1`).get(sourceRecordId) as {target_id:number}|undefined;
+  if(override){
+    linkSource(db,sourceRecordId,'variant',override.target_id,'manual','manual-match-override',at);
+    return{variantId:override.target_id,status:'manual',method:'manual-match-override',confidence:1};
+  }
+  const method=identity.confidence==='aspects'?'ebay-aspect-match':'ebay-title-fallback-match';
+  const confidence=identity.confidence==='aspects'?0.8:0.4;
+  const{candidates,corroborated}=findCandidateVariants(db,identity);
+  // A card number alone repeats constantly across a ~56k-card, multi-language,
+  // multi-set catalogue -- a single hit with no corroborating name match is a
+  // coincidence, not proof, so it goes to review rather than auto-matching.
+  if(candidates.length===1&&corroborated){
+    linkSource(db,sourceRecordId,'variant',candidates[0]!.variantId,'matched',method,at,confidence);
+    return{variantId:candidates[0]!.variantId,status:'matched',method,confidence};
+  }
+  if(candidates.length>=1){
+    recordEbayReview(db,sourceRecordId,at,candidates.length>1
+      ?'Multiple candidate variants matched this eBay listing'
+      :'Card number matched one variant, but with no corroborating card-name match',candidates);
+    return{variantId:null,status:'ambiguous',method,confidence};
+  }
+  recordEbayReview(db,sourceRecordId,at,'No candidate variant found for this eBay listing',[]);
+  return{variantId:null,status:'unmatched',method,confidence:null};
+}
+function upsertEbayListing(db:DatabaseSync,args:{
+  sourceRecordId:number;marketplace:string;itemId:string;legacyItemId:string|null;itemWebUrl:string|null;title:string;
+  grading:GradingInfo;identity:CardIdentity;isLot:boolean;variantId:number|null;
+  matchStatus:'matched'|'unmatched'|'ambiguous'|'manual';matchMethod:string|null;confidence:number|null;
+  at:string;observation:ObservationRow|null;
+}):number{
+  return (db.prepare(`INSERT INTO ebay_listings
+    (source_record_id,marketplace,item_id,legacy_item_id,item_web_url,title,grader,grade_label,grade_value,cert_number,
+     extracted_card_name,extracted_card_number,extracted_set_name,extracted_language,is_lot,variant_id,match_status,match_method,confidence,
+     first_seen_at,last_seen_at,latest_observation_id)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(source_record_id) DO UPDATE SET
+      title=excluded.title,grader=excluded.grader,grade_label=excluded.grade_label,grade_value=excluded.grade_value,cert_number=excluded.cert_number,
+      extracted_card_name=excluded.extracted_card_name,extracted_card_number=excluded.extracted_card_number,extracted_set_name=excluded.extracted_set_name,
+      extracted_language=excluded.extracted_language,is_lot=excluded.is_lot,variant_id=excluded.variant_id,match_status=excluded.match_status,
+      match_method=excluded.match_method,confidence=excluded.confidence,last_seen_at=excluded.last_seen_at,latest_observation_id=excluded.latest_observation_id
+    RETURNING ebay_listing_id`).get(
+      args.sourceRecordId,args.marketplace,args.itemId,args.legacyItemId,args.itemWebUrl,args.title,
+      args.grading.grader,args.grading.gradeLabel,args.grading.gradeValue,args.grading.certNumber,
+      args.identity.cardName,args.identity.cardNumber,args.identity.setName,args.identity.language,
+      args.isLot?1:0,args.variantId,args.matchStatus,args.matchMethod,args.confidence,
+      args.at,args.at,args.observation?.observation_id??null) as {ebay_listing_id:number}).ebay_listing_id;
+}
+async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs):Promise<{listings:number;matchedListings:number;priceObservations:number}>{
+  const rows=latestObservations(db,'item');
+  let listings=0,matchedListings=0,priceObservations=0;
+  for(const row of rows){
+    const match=/^item:([^:]+):(.+)$/.exec(row.scope_key); if(!match) continue;
+    const marketplace=match[1]!,itemId=match[2]!;
+    const item=await readObservationJson<EbayItemDetail>(row,dirs);
+    const record=upsertSourceRecord(db,{source:'ebay',namespace:marketplace,sourceKey:itemId,entityType:'item',language:null,observation:row,observedAt:row.observed_at});
+    const grading=extractGrading(item);
+    if(!isPsa10(grading)){recordParser(db,row,at,{kind:'ebay-item',skipped:'not-psa-10'});continue;}
+    const lot=isLot(item);
+    const identity=extractCardIdentity(item);
+    const resolved=lot
+      ?{variantId:null,status:'unmatched' as const,method:'ebay-lot-excluded',confidence:null}
+      :resolveEbayVariant(db,record,identity,at);
+    const listingId=upsertEbayListing(db,{
+      sourceRecordId:record,marketplace,itemId,legacyItemId:nullableText(item.legacyItemId),itemWebUrl:nullableText(item.itemWebUrl),
+      title:valueText(item.title,itemId),grading,identity,isLot:lot,variantId:resolved.variantId,matchStatus:resolved.status,
+      matchMethod:resolved.method,confidence:resolved.confidence,at,observation:row,
+    });
+    listings++;
+    if(resolved.status==='matched'||resolved.status==='manual') matchedListings++;
+    if(insertEbayPriceObservation(db,listingId,item,row,at)) priceObservations++;
+    recordParser(db,row,at,{kind:'ebay-item',listingId,matchStatus:resolved.status});
+  }
+  return{listings,matchedListings,priceObservations};
+}
+
 export async function materialize(db:DatabaseSync,options:MaterializeOptions={}):Promise<MaterializeResult>{
   const at=options.now??new Date().toISOString();
-  const result:MaterializeResult={sets:0,cards:0,hydratedCards:0,variants:0,assets:0,localAssetsLinked:0,psaSpecs:0,populationRows:0,priceRows:0,censusRows:0,salesRows:0,matchedPsaSpecs:0,openReviews:0};
+  const result:MaterializeResult={sets:0,cards:0,hydratedCards:0,variants:0,assets:0,localAssetsLinked:0,psaSpecs:0,populationRows:0,priceRows:0,censusRows:0,salesRows:0,matchedPsaSpecs:0,ebayListings:0,matchedEbayListings:0,ebayPriceObservations:0,openReviews:0};
   db.exec('BEGIN IMMEDIATE');
   try{
     if(options.includeTcgdex!==false){const tcg=await materializeTcgdex(db,at,options.objectStoreDirs);result.sets=tcg.sets;result.cards=tcg.cards;result.hydratedCards=tcg.hydratedCards;result.variants=tcg.variants;result.assets=tcg.assets;result.localAssetsLinked=tcg.localAssetsLinked;}
-    if(options.includePsa!==false){const psa=await materializePsa(db,options.psaDir??path.join(DATA_DIR,'psa-raw'),at);Object.assign(result,psa);}
+    if(options.includePsa!==false){
+      const psa=await materializePsa(db,options.psaDir??path.join(DATA_DIR,'psa-raw'),at);Object.assign(result,psa);
+      const native=await materializePsaNative(db,at,options.objectStoreDirs);
+      result.psaSpecs+=native.psaSpecs;result.populationRows+=native.populationRows;result.matchedPsaSpecs+=native.matchedPsaSpecs;
+    }
+    if(options.includeEbay!==false){const ebay=await materializeEbay(db,at,options.ebayDirs??EBAY_RAW_DIRS);result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;}
     result.openReviews=Number((db.prepare(`SELECT COUNT(*) n FROM match_reviews WHERE status='open'`).get() as {n:number}).n);
     db.exec('COMMIT');return result;
   }catch(error){db.exec('ROLLBACK');throw error;}

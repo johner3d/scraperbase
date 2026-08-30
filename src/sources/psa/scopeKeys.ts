@@ -27,3 +27,18 @@ export function salesPageScopeKey(specId: string, grade: string, qualifier: stri
 export function salesSnapshotScopeKey(specId: string): string {
   return `sales:${specId}:snapshot`;
 }
+
+/** Root of PSA's own /pop/tcg-cards category tree (all trading card games). */
+export function popCategoryScopeKey(categoryId: string): string {
+  return `pop_category:${categoryId}`;
+}
+
+/** One "year" page within the category tree, fanning out to per-heading links. */
+export function popYearScopeKey(yearHeadingId: string): string {
+  return `pop_year:${yearHeadingId}`;
+}
+
+/** One PSA population-report "heading" (a set, in PSA's own population-report sense). */
+export function popSetItemsScopeKey(headingId: string): string {
+  return `pop_set_items:${headingId}`;
+}

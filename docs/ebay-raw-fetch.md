@@ -241,11 +241,32 @@ then `refresh --source ebay --stage all` + re-`run` to confirm history
 accumulates (`observations` grows, `raw_objects` only grows for content that
 actually changed).
 
+## Matching PSA-10 listings to curated card variants
+
+A second, separate pipeline stage now maps this raw data to the curated
+catalogue: `src/curated/ebayMatch.ts` (extraction/matching logic) and
+`materializeEbay()` in `src/curated/materialize.ts` (orchestration), wired
+into `node src/cli/index.ts materialize --source ebay`. New tables
+`ebay_listings` and `ebay_listing_price_observations`
+(`src/core/db/schema_v6.sql`) hold one row per matched/reviewed listing and
+an append-only price-observation history per listing (asking/bid price, not
+confirmed sold price -- the Browse API doesn't expose that). See
+`v_ebay_psa10_price_comparison` for the variant-level rollup against our own
+`psa_price_current`/`psa_population_current`.
+
+v1 scope only ingests grader=PSA, grade=10 (the schema itself is generic).
+Matching prefers eBay's structured `conditionDescriptors`/`localizedAspects`
+over the free-text title, and requires a corroborating card-name token
+(length >= 3, excluding generic TCG jargon like "vmax"/"psa"/"promo") before
+auto-matching on card number alone -- a bare number match with no
+corroboration goes to `match_reviews` instead of being guessed at, because
+card numbers repeat constantly across this catalogue's ~56k cards. Daily
+re-scrapes are additive and idempotent: rerun `run --source ebay` then
+`materialize --source ebay`.
+
 ## What's deliberately NOT built
 
-No parsing of item fields into structured tables, no matching to the
-curated card catalogue (`source_records`/`source_links`/`assets` from
-`schema_v2.sql`), and no category/price partition coverage layer yet for
+No category/price partition coverage layer yet for
 queries above eBay's 10,000-result window. Search pages move while they are
 being read, so exhaustive discovery will also need repeat-pass convergence
 based on newly observed item IDs. Request spacing remains conservative

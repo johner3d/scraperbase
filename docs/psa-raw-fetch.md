@@ -1,17 +1,49 @@
 # PSA raw fetch
 
 Everything built so far for getting population and sales-history data out of
-PSA (psacard.com) for Pokemon cards. Two layers exist side by side right now:
+PSA (psacard.com) for Pokemon cards. Three layers exist side by side right now:
 
-1. **Standalone scripts** (`src/scripts/psa-fetch.ts`, `psa-test-fetch.ts`) --
-   working, already used to pull real data. Zero dependency on the queue/
-   object-store system.
-2. **A discovery `Collector`** (`src/sources/psa/discovery.ts`) -- written for
-   the queue-driven pipeline (`src/core/queue/`), but not yet wired into any
-   CLI command, and has no population/sales collector counterpart yet.
+1. **Legacy standalone scripts** (`src/scripts/psa-fetch.ts`,
+   `psa-test-fetch.ts`) -- work, already used to pull real data, but depend on
+   `data/psa-pre2019-en-selection.json`, a one-time snapshot originally copied
+   from a sibling project. That snapshot is a dead end: it covers 27 of ~135
+   pre-2019 English releases, nothing post-2019, and (confirmed live
+   2026-08-29) is missing entries even within nominally-covered releases --
+   e.g. only 3 of 53 Wizards Black Star Promo cards, which is why cards like
+   Surfing Pikachu (`basep-28`) had no PSA data in the UI despite PSA having
+   real population history for it. **Do not extend this snapshot further** --
+   use the native pipeline below instead.
+2. **Native discovery + materialization** (`src/sources/psa/collectors/
+   popDiscovery.ts`, `setItems.ts`, `src/curated/psaSetMatch.ts`,
+   `psaCardMatch.ts`) -- fully owned by this repo, zero external dependency.
+   Crawls PSA's own `/pop/tcg-cards` population-report tree to discover every
+   PSA "heading" (population-report set), matches each heading to a tcgdex
+   set (`psa_set_map`), then per heading calls PSA's `/Pop/GetSetItems` to get
+   every card + variety + per-grade population count in one call, matched to
+   a tcgdex card/variant by card number (`src/curated/psaCardMatch.ts`). Run
+   via `npm run cli -- run --source psa --stage index` (discovery) then
+   `--stage details` (per-heading fetch); `materialize` then does the
+   matching + curated writes. Check current coverage with
+   `npm run cli -- psa-coverage`.
+3. **A discovery `Collector`** (`src/sources/psa/discovery.ts`, PSA's older
+   `GetSetList` endpoint) -- superseded by (2)'s richer `/Pop/GetSetItems`
+   (which returns population counts, variety, and a modern unified spec id in
+   one call); kept around only as a reference, not wired into any CLI command.
 
-If you just want to fetch data, use the scripts (section 2 below). Section 4
-covers the queue-based module for whoever picks that up next.
+Section 4 covers the legacy queue module. Sections 2-3 cover the legacy
+scripts. See the native pipeline's own doc comments in the files listed above
+for the current, supported path.
+
+**Known gap in the native pipeline (as of 2026-08-29):** population counts
+are fully native and working end-to-end. Price-guide (`researchJourney.
+getPriceSummary`) and sales (`researchJourney.getSalesBySpecId`) for natively
+discovered cards are not yet ported -- confirmed live that both are called
+from PSA's modern `/spec/psa/{id}` page using the *same* unified spec id
+`/Pop/GetSetItems` already returns, so wiring them up is a follow-up, not a
+redesign. Non-English `Variety` rows within an English-mapped heading (e.g.
+"Pokemon League-French" rows inside the `basep` heading) are also currently
+skipped rather than cross-set-resolved -- see `isEnglishRow()` in
+`src/curated/psaCardMatch.ts`.
 
 ## 1. Auth and browser profile
 

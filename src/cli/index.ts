@@ -9,6 +9,7 @@ import { verifyCommand } from './commands/verify.ts';
 import { reportCommand } from './commands/report.ts';
 import { psaLoginCommand } from './commands/psa-login.ts';
 import { materializeCommand } from './commands/materialize.ts';
+import { psaCoverageCommand } from './commands/psa-coverage.ts';
 
 const COMMANDS: Record<string, (args: string[]) => Promise<void>> = {
   run: runCommand,
@@ -22,6 +23,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<void>> = {
   report: reportCommand,
   'psa-login': psaLoginCommand,
   materialize: materializeCommand,
+  'psa-coverage': psaCoverageCommand,
 };
 
 const [, , command, ...rest] = process.argv;

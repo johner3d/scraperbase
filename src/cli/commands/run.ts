@@ -33,6 +33,9 @@ import {
   type EbayMarketplaceKey,
 } from '../../sources/ebay/config.ts';
 import { printEbayRunSummary } from '../../sources/ebay/summary.ts';
+import { launchPsaProfile } from '../../sources/psa/browser/profile.ts';
+import { createPsaPopDiscoveryCollector, seedPsaPopDiscovery } from '../../sources/psa/collectors/popDiscovery.ts';
+import { createPsaSetItemsCollector } from '../../sources/psa/collectors/setItems.ts';
 
 export type AcquisitionStage = 'index' | 'details' | 'images' | 'all';
 export type DetailPriority = 'psa' | 'all';
@@ -221,8 +224,40 @@ export async function runCommand(args: string[]): Promise<void> {
         });
       }
       printEbayRunSummary(db, runId);
+    } else if (opts.source === 'psa') {
+      // Native discovery of PSA's own population-report tree (see
+      // src/sources/psa/collectors/popDiscovery.ts) -- replaces the old
+      // dependency on a hand-curated snapshot from clean_rewrite. Needs a
+      // real, Cloudflare-cleared browser profile signed in via `psa-login`.
+      // Cooldown constants match the legacy psa-fetch.ts safety valve
+      // (confirmed live 2026-08-29: a details-stage run without this hit a
+      // sustained 429 storm because runQueue had no circuit breaker and kept
+      // claiming fresh pending items at full rate-limiter speed regardless
+      // of how many in a row had just failed).
+      const rateLimiter = createRateLimiter({ minDelayMs: 600, jitterMs: 300 });
+      const cooldown = { afterConsecutiveFailures: 3, cooldownMs: 60_000 };
+      const context = await launchPsaProfile({ headless: false });
+      const page = await context.newPage();
+      try {
+        await page.goto('https://www.psacard.com/pop/tcg-cards/156940', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+        if (opts.stage === 'index' || opts.stage === 'all') {
+          seedPsaPopDiscovery(db);
+          await runQueue(db, {
+            queue: 'psa_pop_discovery', collector: createPsaPopDiscoveryCollector({ page, rateLimiter }),
+            concurrency: 1, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, cooldown,
+          });
+        }
+        if (opts.stage === 'details' || opts.stage === 'all') {
+          await runQueue(db, {
+            queue: 'psa_pop_set_items', collector: createPsaSetItemsCollector({ page, rateLimiter }),
+            concurrency: 1, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, cooldown,
+          });
+        }
+      } finally {
+        await context.close();
+      }
     } else {
-      console.error(`Source '${opts.source}' is not implemented yet (PSA arrives in Phase 3).`);
+      console.error(`Unknown source '${opts.source}'.`);
       process.exitCode = 1;
     }
     finishRun(db, runId, draining ? 'cancelled' : 'completed');
