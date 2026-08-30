@@ -15,6 +15,7 @@
     "web:build": "vite build",
     "web": "node src/web/server.ts",
     "psa:import": "node src/scripts/psa-backfill-import.ts",
+    "psa:fetch-missing": "node src/scripts/psa-fetch.ts --from-db",
     "pokewiki:images": "node src/scripts/pokewiki-image-backfill.ts"
   },
   "dependencies": {

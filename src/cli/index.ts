@@ -11,6 +11,7 @@ import { psaLoginCommand } from './commands/psa-login.ts';
 import { materializeCommand } from './commands/materialize.ts';
 import { psaCoverageCommand } from './commands/psa-coverage.ts';
 import { ebayMatchReportCommand } from './commands/ebay-match-report.ts';
+import { psaFetchMatchedCommand } from './commands/psa-fetch-matched.ts';
 
 const COMMANDS: Record<string, (args: string[]) => Promise<void>> = {
   run: runCommand,
@@ -26,6 +27,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<void>> = {
   materialize: materializeCommand,
   'psa-coverage': psaCoverageCommand,
   'ebay-match-report': ebayMatchReportCommand,
+  'psa-fetch-matched': psaFetchMatchedCommand,
 };
 
 const [, , command, ...rest] = process.argv;

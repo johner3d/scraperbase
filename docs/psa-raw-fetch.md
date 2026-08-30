@@ -70,6 +70,21 @@ session that every other PSA tool reuses. It's gitignored (all of `data/` is).
 npx tsx src/scripts/psa-fetch.ts [--releases=base1,base2,...] [--only=population|sales|both] [--limit=N] [--offset=N] [--since=YYYY-MM-DD] [--force]
 ```
 
+To backfill every missing raw file represented by the currently matched PSA
+specs in the database, run:
+
+```bash
+npm run psa:fetch-missing
+```
+
+This is resumable: existing population files and complete price-history
+checkpoints are skipped, while missing or incomplete files are fetched. Use
+`npm run psa:fetch-missing -- --only=population` or
+`npm run psa:fetch-missing -- --only=sales` to run one phase. When a separate
+sales-namespace mapping is absent, the population spec ID is used as the
+sales ID, which covers the normal PSA case without dropping the price-history
+backfill.
+
 Reads `data/psa-pre2019-en-selection.json` (see section 3 -- where that file
 comes from), processes it **one release at a time** ("slices"), and for each
 release:
@@ -103,6 +118,54 @@ left off. `--force` overrides that.
 60s before continuing (`maybeCooldown`) rather than hammering PSA through a
 rate limit or re-challenge. If failures keep happening after a cooldown,
 that's a signal to stop and investigate, not to let it spin for hours.
+
+### `psa-fetch-matched` -- the targeted one
+
+```bash
+npm run cli -- psa-fetch-matched --dry-run
+npm run cli -- psa-fetch-matched [--limit=N] [--force] [--max-age=DAYS] [--only=population|sales|both] [--since=YYYY-MM-DD] [--tiers=exact,strong] [--exclude-flagged] [--live-auctions] [--no-import] [--json]
+```
+
+Same fetch engine (`src/sources/psa/rawFetch.ts`, shared with `psa-fetch.ts`),
+different targets: instead of a release-year slice of the whole catalogue, it
+fetches only the card variants that **currently have matched eBay listings**,
+deduplicated to one fetch per PSA spec no matter how many auctions point at
+it. This is the on-demand companion to a matching run -- the bulk
+through-2009 walk is both slow and pointed at the wrong cards, since the eBay
+feed is as modern as it is vintage.
+
+Target selection lives in `src/curated/psaTargets.ts`
+(`selectEbayMatchedTargets`): `ebay_listings` joined to `psa_specs` via
+`variant_id`, `match_status IN ('matched','manual')`, `GROUP BY spec_id`.
+
+| Flag | Meaning |
+|---|---|
+| `--dry-run` | Print the targets and the unresolved-set work list, then exit. No browser, no run row, no writes. |
+| `--limit=N` | Cap the fetch, applied after deduplication. |
+| `--force` | Refetch regardless of what is already on disk. |
+| `--max-age=DAYS` | Without `--force`, refetch anything saved longer ago than this. Default 7; `0` restores the old "skip if the file exists" behaviour. |
+| `--tiers=` / `--exclude-flagged` / `--live-auctions` | Narrow which matched listings count. `--live-auctions` is the `/auctions` dashboard slice: trusted tier, unflagged, single card, PSA 10. |
+| `--only=` / `--since=` | As `psa-fetch.ts`. |
+| `--no-import` | Fetch files only, skipping the DB import + materialize. |
+
+**Persistence**: unless `--no-import`, the files it just wrote are imported via
+`psa-backfill-import.ts` and then materialized. Note that the PSA materialize
+is a **full rebuild** by design (`materializePsa` opens with
+`DELETE FROM psa_specs` and re-reads all of `data/psa-raw` plus the native pop
+observations), so it costs the same whether the run fetched 3 specs or 300 --
+for a tight fetch loop use `--no-import` and materialize once at the end.
+
+**Coverage limit worth knowing**: a matched variant is only fetchable if it
+already has a `psa_specs` population row, because the spec ID is what every
+PSA endpoint is keyed by. As of 2026-08-30, 130 of 684 matched variants do;
+the other 554 (concentrated in modern JP/SV sets) need
+`run --source psa --stage index|details` to crawl PSA's pop-report tree and
+mint their spec IDs first. They are never silently dropped -- `--dry-run`
+lists them grouped by set.
+
+**Background runs**: `.\scripts\start-psa-matched.ps1 [extra args]` launches it
+detached with a PID guard (`data/psa-matched.pid`) and logs to
+`data/psa-matched.log`; `.\scripts\stop-psa-fetch.ps1` stops either ingest.
 
 ### `psa-test-fetch.ts` -- the smoke test
 
@@ -231,6 +294,15 @@ returns 401 UNAUTHORIZED unless the page has actually navigated to a
 entry) -- population's `GetChartPopulation` endpoint doesn't have this
 requirement. Both scripts do this; a future port into a `Collector` needs to
 preserve it.
+
+**The two source URLs are not interchangeable.** Population scrapes the price
+guide and condition-census tables, and only the CardFacts page
+(`cardFactsUrl()` in `sources/psa/config.ts`) carries them -- a `/spec/psa/`
+fetch returns HTML with neither table and silently saves empty `priceRows`
+and `censusRows`. Sales is the other way round: it uses its URL only to
+establish the session, and the tRPC API 401s unless the page navigated to
+`/spec/psa/`. Confirmed live 2026-08-30, after the DB-derived selection path
+had been building `/spec/psa/` URLs for both.
 
 **Zero sales/price/census rows is often normal, not a failure.** Many cards
 have no recorded PSA-10 sales in the lookback window, or no price-guide data

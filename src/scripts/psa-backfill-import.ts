@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
 import { openCliDb } from '../cli/context.ts';
 import { withTransaction } from '../core/db/client.ts';
@@ -89,7 +90,7 @@ function insertAttemptAndObservation(
   ).run(attempt.attempt_id, args.workItemId, args.hash, args.fetchedAt, args.entityType, args.scopeKey, args.isNewObject ? 1 : 0);
 }
 
-async function importPopulationFile(db: DatabaseSync, filePath: string, runId: string): Promise<'imported' | 'skipped'> {
+export async function importPopulationFile(db: DatabaseSync, filePath: string, runId: string): Promise<'imported' | 'skipped'> {
   const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as PopulationFile;
   const specId = String(data.psaSpecId);
   const popScopeKey = populationScopeKey(specId);
@@ -168,7 +169,7 @@ async function importPopulationFile(db: DatabaseSync, filePath: string, runId: s
   return 'imported';
 }
 
-async function importSalesFile(db: DatabaseSync, filePath: string, runId: string): Promise<'imported' | 'skipped'> {
+export async function importSalesFile(db: DatabaseSync, filePath: string, runId: string): Promise<'imported' | 'skipped'> {
   const raw = fs.readFileSync(filePath);
   const data = JSON.parse(raw.toString('utf8')) as SalesFile;
   const specId = String(data.salesSpecId);
@@ -223,7 +224,7 @@ async function importSalesFile(db: DatabaseSync, filePath: string, runId: string
 }
 
 /** Cross-references the two separate PSA ID namespaces via matching (sourceCardId, finish, printRunMarker, microVariant). */
-function linkPopulationToSales(db: DatabaseSync): number {
+export function linkPopulationToSales(db: DatabaseSync): number {
   const explicit: Array<{ populationId: string; salesId: string }> = [];
   for (const baseDir of SCAN_DIRS) {
     if (!fs.existsSync(baseDir)) continue;
@@ -293,7 +294,11 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Importable: `psa-fetch-matched` reuses importPopulationFile/importSalesFile
+// to import just the files it fetched, so main() must not fire on import.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

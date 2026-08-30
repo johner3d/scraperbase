@@ -152,6 +152,17 @@ is the point: they are acquisition work, not review work.
 3. **Add set aliases.** `ebay-match-report` lists the set names in the review
    queue that no alias resolves; add the real ones to
    [`data/aliases/ebay-sets.json`](../data/aliases/ebay-sets.json).
+4. **Price what was matched.** Once matching has run, pull PSA population and
+   price history for exactly the variants the matches point at:
+
+   ```text
+   npm run cli -- psa-fetch-matched --dry-run
+   npm run cli -- psa-fetch-matched
+   ```
+
+   See [PSA raw fetch](psa-raw-fetch.md). Its dry run doubles as a second work
+   list: the matched variants that have no PSA spec yet, grouped by set, which
+   is what step 1 above is ultimately unblocking.
 
 ## Feedback loop
 

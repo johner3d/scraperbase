@@ -669,7 +669,14 @@ async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omi
   for(const [popId,data] of populations){
     if(data.salesSpecId==null)continue;
     const popPk=popPks.get(popId),salesPk=salesPks.get(String(data.salesSpecId));if(popPk==null||salesPk==null)continue;
-    db.prepare(`INSERT INTO psa_spec_pairs(population_spec_pk,sales_spec_pk,link_method,confidence,created_at)
+    // OR IGNORE, because psa_spec_pairs is unique on sales_spec_pk and two
+    // population files can legitimately claim the same sales spec: the
+    // DB-derived selection path (psa-fetch.ts --from-db, psa-fetch-matched)
+    // sets salesSpecId = psaSpecId, while older selection-file entries carry
+    // a separately-curated sales ID that may point at the same spec. One
+    // ambiguous pairing must not abort materializing everything else --
+    // same reasoning as the bad-heading skip above.
+    db.prepare(`INSERT OR IGNORE INTO psa_spec_pairs(population_spec_pk,sales_spec_pk,link_method,confidence,created_at)
       VALUES(?,?,'explicit-selection-id',1,?)`).run(popPk,salesPk,at);
   }
   return{psaSpecs,populationRows,priceRows,censusRows,salesRows,matchedPsaSpecs};
