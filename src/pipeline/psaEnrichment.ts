@@ -12,16 +12,18 @@ import { OUT_DIR, bestSalesCheckpoint, indexSalesCheckpoints, installStopHandler
 import { importPopulationFile, importSalesFile, linkPopulationToSales } from '../scripts/psa-backfill-import.ts';
 import { materialize } from '../curated/materialize.ts';
 import { PipelinePausedError } from './pause.ts';
+import { recordDeadLetter } from './deadLetters.ts';
 
-const POP_QUEUE='psa_enrichment_population';
-const SALES_QUEUE='psa_enrichment_sales';
+export const POP_QUEUE='psa_enrichment_population';
+export const SALES_QUEUE='psa_enrichment_sales';
 const DAY_MS=86_400_000;
 
 interface Params { selection:Selection; maxAgeDays:number; salesAuditDays:number }
 
-function scope(phase:'population'|'sales',specId:number):string{return `enrichment:${phase}:spec=${specId}`;}
+export function psaEnrichmentScope(phase:'population'|'sales',specId:number):string{return `enrichment:${phase}:spec=${specId}`;}
+const scope=psaEnrichmentScope;
 
-function seed(db:DatabaseSync,selections:Selection[],maxAgeDays:number,salesAuditDays:number):void{
+export function seedPsaEnrichment(db:DatabaseSync,selections:Selection[],maxAgeDays:number,salesAuditDays:number):void{
   const now=new Date().toISOString();const staleBefore=new Date(Date.now()-maxAgeDays*DAY_MS).toISOString();
   for(const selection of selections){
     const params:Params={selection,maxAgeDays,salesAuditDays};
@@ -35,6 +37,12 @@ function seed(db:DatabaseSync,selections:Selection[],maxAgeDays:number,salesAudi
   db.prepare(`UPDATE work_items SET state='pending',attempts=0,available_at=?,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL,updated_at=?
     WHERE source='psa' AND queue IN (?,?) AND state='succeeded' AND updated_at<?`).run(now,now,POP_QUEUE,SALES_QUEUE,staleBefore);
 }
+
+const seed=seedPsaEnrichment;
+
+export function psaPopulationCollector(page:Page):Collector{return populationCollector(page);}
+export function psaSalesCollector(page:Page):Collector{return salesCollector(page);}
+export function psaTargetFiles(selections:Selection[],kind:'population'|'sales'):string[]{return targetFiles(selections,kind);}
 
 function populationCollector(page:Page):Collector{
   return async(_db,item)=>{
@@ -59,7 +67,10 @@ function salesCollector(page:Page):Collector{
     const expected=path.join(OUT_DIR,selection.release,'sales',`${selection.salesSpecId}.json`);
     if(shouldStop()&&!fs.existsSync(expected))return{outcome:'failure',final:'partial',sourceIdentity:'psa:enrichment',
       errorMessage:'PSA fetch paused before sales acquisition'};
-    const stats=await runSales(page,selection.release,[selection],{force:false,maxAgeMs:maxAgeDays*DAY_MS,cutoffIso:null,auditMaxAgeMs:salesAuditDays*DAY_MS});
+    // cutoffIso stays null so the cheap incremental/overlap path is preserved;
+    // the per-spec wall-clock budget + lowered page cap in runSales are what
+    // stop a single long-history spec from stalling the whole enrichment queue.
+    const stats=await runSales(page,selection.release,[selection],{force:false,maxAgeMs:maxAgeDays*DAY_MS,cutoffIso:null,auditMaxAgeMs:salesAuditDays*DAY_MS,salesBudgetMs:90_000});
     if(stats.failed)return{outcome:stats.rateLimited?'rate_limited':'failure',final:stats.rateLimited?'partial':'retryable_failed',
       sourceIdentity:'psa:enrichment',httpStatus:stats.rateLimited?429:undefined,retryAfterMs:stats.rateLimited?60_000:undefined,
       errorMessage:`Sales fetch failed for ${selection.salesSpecId}${stats.rateLimited?' (rate limited)':''}`};
@@ -95,14 +106,22 @@ export async function enrichMatchedPsa(db:DatabaseSync,pipelineRunId:string,sele
       workItemId('psa',POP_QUEUE,scope('population',selection.psaSpecId)),
       ...(selection.salesSpecId==null?[]:[workItemId('psa',SALES_QUEUE,scope('sales',selection.salesSpecId))]),
     ]);
-    const failures=targetIds.length?Number((db.prepare(`SELECT COUNT(*) n FROM work_items WHERE work_item_id IN (${targetIds.map(()=>'?').join(',')}) AND state<>'succeeded'`)
-      .get(...targetIds) as {n:number}).n):0;
-    if(failures){
-      const paused=targetIds.length?Number((db.prepare(`SELECT COUNT(*) n FROM work_items WHERE work_item_id IN (${targetIds.map(()=>'?').join(',')})
-        AND state IN ('partial','pending','retryable_failed') AND (last_error LIKE '%rate limit%' OR last_error LIKE '%paused%')`)
-        .get(...targetIds) as {n:number}).n):0;
-      if(paused)throw new PipelinePausedError('psa',null,`${failures} PSA enrichment target(s) remain durably paused`);
-      throw new Error(`${failures} durable PSA enrichment work item(s) did not succeed`);
+    // A genuine rate-limit pause still stops the run and is retained as a
+    // pause the operator resumes. Anything else -- a spec that exhausted its
+    // attempts -- goes to the visible dead-letter and the run keeps going,
+    // importing every spec that did succeed.
+    const stuck=targetIds.length?db.prepare(`SELECT work_item_id,queue,scope_key,state,last_error FROM work_items
+      WHERE work_item_id IN (${targetIds.map(()=>'?').join(',')}) AND state<>'succeeded'`).all(...targetIds) as unknown as
+      Array<{work_item_id:string;queue:string;scope_key:string;state:string;last_error:string|null}>:[];
+    const paused=stuck.filter((row)=>['partial','pending','retryable_failed'].includes(row.state)
+      && /rate limit|paused|429/i.test(row.last_error ?? ''));
+    if(paused.length){
+      throw new PipelinePausedError('psa',null,`${paused.length} PSA enrichment target(s) remain durably paused`);
+    }
+    for(const row of stuck.filter((r)=>r.state==='permanent_failed')){
+      recordDeadLetter(db,{stage:'psa-fetch',scopeKey:row.scope_key,workItemId:row.work_item_id,
+        reason:row.last_error ?? 'PSA enrichment work item exhausted its attempts',
+        detail:{queue:row.queue}});
     }
     let imported=0;
     for(const file of targetFiles(selections,'population'))if(await importPopulationFile(db,file,runId)==='imported')imported++;

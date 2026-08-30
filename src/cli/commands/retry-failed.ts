@@ -16,7 +16,10 @@ export async function retryFailedCommand(args: string[]): Promise<void> {
   const db = openCliDb();
 
   if (values.all) {
-    const n = resetPermanentFailures(db, values.source as string | undefined, values.queue as string | undefined);
+    const n = resetPermanentFailures(db, {
+      source: values.source as string | undefined,
+      queue: values.queue as string | undefined,
+    });
     console.log(`Reset ${n} permanently-failed item(s) back to pending.`);
   } else {
     const now = new Date().toISOString();

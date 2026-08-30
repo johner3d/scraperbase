@@ -13,9 +13,35 @@ import { DATA_DIR } from '../../core/config/config.ts';
 
 export const OUT_DIR = path.join(DATA_DIR, 'psa-raw');
 export const STOP_FILE = path.join(DATA_DIR, 'psa-fetch.stop');
+
+/**
+ * The persistent PSA browser profile is no longer signed in (a navigation
+ * landed on a sign-in / collectors.com page). Thrown instead of blocking up to
+ * ten minutes for an interactive login that never comes in an unattended run.
+ * Pipeline stages catch it and convert it into a pause resolved by
+ * `npm run cli -- pipeline psa-login`.
+ */
+export class PsaSessionExpiredError extends Error {
+  constructor(message = 'PSA session expired -- run: npm run cli -- pipeline psa-login') {
+    super(message);
+    this.name = 'PsaSessionExpiredError';
+  }
+}
+
+/** True when a navigation ended up on an auth wall rather than psacard.com content. */
+export function isPsaSignInUrl(url: string): boolean {
+  return /collectors\.com\/(signin|login)|psacard\.com\/(signin|login)|\/account\/login/i.test(url);
+}
 export const BOOTSTRAP_URL = 'https://www.psacard.com/cardfacts/pokemon/base-set/card/641285';
 const SALES_PAGE_SIZE = 5; // hard server-side limit, confirmed live
-const SALES_MAX_PAGES = 10_000; // real safety cap -- termination is via the --since cutoff, not this
+// Real cap now, not a theoretical one: 400 pages x 5 rows = 2,000 sales, well
+// past what any price chart needs. Combined with the per-spec wall-clock budget
+// below it stops a single long-history spec from eating a whole fetch window.
+// Termination is normally the `--since` / cutoffIso cutoff; this and the budget
+// are the backstops. A spec that hits either saves a resumable (coverageComplete
+// = false) checkpoint and is continued on the next pass.
+const SALES_MAX_PAGES = 400;
+const SALES_DEFAULT_SPEC_BUDGET_MS = 90_000; // wall-clock ceiling for one spec's sales walk
 const SALES_REQUEST_DELAY_MS = 600;
 const POPULATION_REQUEST_DELAY_MS = 800;
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504, 524]);
@@ -128,7 +154,7 @@ interface SavedSalesCheckpoint {
   fetchedAt?: string;
   cutoffIso?: string | null;
   coverageComplete?: boolean;
-  coverageEvidence?: 'source_exhausted' | 'user_cutoff' | 'known_overlap' | 'page_cap_reached';
+  coverageEvidence?: 'source_exhausted' | 'user_cutoff' | 'known_overlap' | 'page_cap_reached' | 'time_budget';
   lastFullAuditAt?: string;
   sales?: RawApiSale[];
   totalCount?: number;
@@ -308,10 +334,11 @@ function saleIdentity(sale:RawApiSale):string{
 }
 
 async function fetchSalesOne(page: Page, entry: Selection, outDir: string, options: {
-  cutoffIso: string | null; auditMaxAgeMs?: number; now?: number;
+  cutoffIso: string | null; auditMaxAgeMs?: number; now?: number; budgetMs?: number;
 }): Promise<string> {
   const outPath = path.join(outDir, `${entry.salesSpecId}.json`);
   const cutoffIso=options.cutoffIso;
+  const deadline = Date.now() + (options.budgetMs ?? SALES_DEFAULT_SPEC_BUDGET_MS);
   let allSales: RawApiSale[] = [];
   let totalCount = 0;
   let pagesFetched = 0;
@@ -367,6 +394,11 @@ async function fetchSalesOne(page: Page, entry: Selection, outDir: string, optio
       sales:deduped,
     });
     if (reachedCutoff || shouldStop()) break;
+    if (Date.now() >= deadline) {
+      coverageEvidence = 'time_budget';
+      console.log(`  sales walk hit its ${Math.round((options.budgetMs ?? SALES_DEFAULT_SPEC_BUDGET_MS) / 1000)}s budget after ${pagesFetched} page(s) -- checkpoint saved, will resume`);
+      break;
+    }
     await page.waitForTimeout(SALES_REQUEST_DELAY_MS);
   }
 
@@ -418,7 +450,7 @@ export async function runPopulation(page: Page, release: string, entries: Select
 }
 
 export async function runSales(page: Page, release: string, entries: Selection[], options: FetchOptions & {
-  cutoffIso: string | null; auditMaxAgeMs?: number;
+  cutoffIso: string | null; auditMaxAgeMs?: number; salesBudgetMs?: number;
 }): Promise<PhaseStats> {
   const stats: PhaseStats = { fetched: 0, skipped: 0, failed: 0, written: [] };
   const withSalesId = entries.filter((e): e is Selection & { salesSpecId: number; salesSourceUrl: string } => e.salesSpecId !== null);
@@ -433,9 +465,8 @@ export async function runSales(page: Page, release: string, entries: Selection[]
   const firstUrl = withSalesId[0].salesSourceUrl;
   console.log(`[sales/${release}] establishing session via ${firstUrl}...`);
   await page.goto(firstUrl, { waitUntil: 'networkidle', timeout: 60_000 });
-  if (page.url().includes('collectors.com/signin')) {
-    console.log('  redirected to sign-in -- waiting up to 10 minutes for manual sign-in...');
-    await page.waitForURL((url) => url.hostname === 'www.psacard.com', { timeout: 600_000 });
+  if (isPsaSignInUrl(page.url())) {
+    throw new PsaSessionExpiredError();
   }
   await page.waitForTimeout(1500);
 
@@ -453,7 +484,7 @@ export async function runSales(page: Page, release: string, entries: Selection[]
     console.log(`[sales/${release}] ${entry.sourceCardId} ${entry.finish}/${entry.printRunMarker} (spec ${entry.salesSpecId})...`);
     try {
       stats.written.push(await fetchSalesOne(page, entry, outDir, {
-        cutoffIso:options.cutoffIso,auditMaxAgeMs:options.auditMaxAgeMs,now:options.now,
+        cutoffIso:options.cutoffIso,auditMaxAgeMs:options.auditMaxAgeMs,now:options.now,budgetMs:options.salesBudgetMs,
       }));
       stats.fetched++;
       consecutiveFailures = 0;

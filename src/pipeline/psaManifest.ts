@@ -71,27 +71,44 @@ function summary(db: DatabaseSync, pipelineRunId: string): PsaManifestSummary {
  * specs halfway through acquisition.
  */
 export function snapshotPsaTargets(db: DatabaseSync, pipelineRunId: string,
-  options:{refresh?:boolean;ebayComplete?:boolean}={}): PsaManifestSummary {
+  options:{refresh?:boolean;ebayComplete?:boolean;activeOnly?:boolean;activeMarginMinutes?:number;cap?:number|null}={}): PsaManifestSummary {
   if (rows(db, pipelineRunId).length && !options.refresh) return summary(db, pipelineRunId);
   const now = new Date().toISOString();
   const latest=db.prepare(`SELECT COALESCE(MAX(manifest_revision),0) revision FROM pipeline_psa_manifest_revisions
     WHERE pipeline_run_id=?`).get(pipelineRunId) as {revision:number};
   const revision=Number(latest.revision)+1;
-  const candidates = db.prepare(`SELECT DISTINCT ps.spec_id population_spec_id,ps.spec_id sales_spec_id,
+  const margin = Number.isFinite(options.activeMarginMinutes) ? Number(options.activeMarginMinutes) : 30;
+  const cap = options.cap == null ? null : Math.max(1, Math.trunc(options.cap));
+  // When activeOnly, only specs still backed by a live auction become targets,
+  // and the ORDER BY drains soonest-closing first so a `cap` keeps the urgent
+  // specs rather than the oldest ones.
+  const activeClause = options.activeOnly
+    ? `AND lp.item_end_date > datetime('now', printf('+%d minutes', CAST(? AS INTEGER)))`
+    : '';
+  const candidateParams: number[] = [];
+  if (options.activeOnly) candidateParams.push(margin);
+  if (cap != null) candidateParams.push(cap);
+  const candidates = db.prepare(`SELECT ps.spec_id population_spec_id,ps.spec_id sales_spec_id,
       v.variant_id,s.source_set_id,s.source_set_id||'-'||c.local_id source_card_id,
-      COALESCE(v.finish,'unknown') finish,COALESCE(v.print_run_marker,'unknown') print_run_marker,v.micro_variant
+      COALESCE(v.finish,'unknown') finish,COALESCE(v.print_run_marker,'unknown') print_run_marker,v.micro_variant,
+      MIN(CASE WHEN lp.item_end_date > datetime('now') THEN lp.item_end_date END) next_future_end
     FROM ebay_listings e
     JOIN variants v ON v.variant_id=e.variant_id
     JOIN cards c ON c.card_id=v.card_id
     JOIN sets s ON s.set_id=c.set_id
     JOIN psa_specs ps ON ps.variant_id=v.variant_id AND ps.namespace='population'
       AND ps.match_status IN ('matched','manual')
+    LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id
     WHERE e.variant_id IS NOT NULL AND e.match_status IN ('matched','manual')
       AND e.match_tier IN ('exact','strong') AND e.flagged=0
       AND (e.match_method IS NULL OR e.match_method<>'ebay-cluster-propagate')
-    ORDER BY s.release_date,s.source_set_id,c.local_sort_key,ps.spec_id,v.variant_id`).all() as unknown as Array<{
+      ${activeClause}
+    GROUP BY ps.spec_id,v.variant_id
+    ORDER BY (next_future_end IS NULL) ASC, next_future_end ASC,
+      s.release_date,s.source_set_id,c.local_sort_key,ps.spec_id,v.variant_id
+    ${cap != null ? 'LIMIT ?' : ''}`).all(...candidateParams) as unknown as Array<{
       population_spec_id:string;sales_spec_id:string;variant_id:number;source_set_id:string;source_card_id:string;
-      finish:string;print_run_marker:string;micro_variant:string|null;
+      finish:string;print_run_marker:string;micro_variant:string|null;next_future_end:string|null;
     }>;
   const existingTarget=db.prepare(`SELECT pipeline_psa_target_id FROM pipeline_psa_targets
     WHERE pipeline_run_id=? AND population_spec_id=? AND variant_id=?`);

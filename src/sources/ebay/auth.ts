@@ -1,3 +1,4 @@
+import { EBAY_TOKEN_TIMEOUT_MS } from '../../core/config/config.ts';
 import { EBAY_TOKEN_URL, loadEbayCredentials } from './config.ts';
 
 interface CachedToken {
@@ -28,6 +29,7 @@ export async function getEbayAccessToken(): Promise<string> {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: 'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
+    signal: AbortSignal.timeout(EBAY_TOKEN_TIMEOUT_MS),
   });
 
   if (!res.ok) {

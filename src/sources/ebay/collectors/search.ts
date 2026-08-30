@@ -37,6 +37,12 @@ export interface SearchParams {
   priceMin?: number;
   priceMax?: number;
   refreshDetails?: boolean | number;
+  /** eBay leaf category ids (CSV) -- narrows the result set before it costs an item-detail call. */
+  categoryIds?: string;
+  /** Managed-search-term provenance, for the dashboard funnel. Never participates in matching. */
+  searchTermId?: number;
+  /** Server-side buying-option narrowing independent of `mode`. */
+  buyingOption?: 'auction' | 'fixed' | 'all';
 }
 
 export interface SearchDeps {
@@ -113,13 +119,24 @@ export function buildSearchUrl(params: SearchParams): string {
     offset: String(params.offset),
   });
   const liveAuctions = params.mode === 'live_auctions';
-  const filters = [`buyingOptions:{${liveAuctions ? 'AUCTION' : EBAY_ALL_BUYING_OPTIONS.join('|')}}`];
+  const buyingOption = params.buyingOption ?? (liveAuctions ? 'auction' : 'all');
+  const buyingOptionsFilter =
+    buyingOption === 'auction' || liveAuctions ? 'AUCTION'
+    : buyingOption === 'fixed' ? 'FIXED_PRICE|BEST_OFFER'
+    : EBAY_ALL_BUYING_OPTIONS.join('|');
+  const filters = [`buyingOptions:{${buyingOptionsFilter}}`];
   if (def.itemLocationCountries?.length) filters.push(`itemLocationCountry:{${def.itemLocationCountries.join('|')}}`);
   if (params.priceMin != null || params.priceMax != null) {
     filters.push(`price:[${(params.priceMin ?? 0).toFixed(2)}..${params.priceMax == null ? '' : params.priceMax.toFixed(2)}]`);
     filters.push(`priceCurrency:${def.currency}`);
   }
+  // Server-side end-date ceiling for live sweeps: fewer pages to walk than
+  // relying on the client-side cutoff + "soonest ending first" stop alone.
+  if (liveAuctions && params.endingBeforeAt) {
+    filters.push(`itemEndDate:[..${params.endingBeforeAt}]`);
+  }
   qs.set('filter', filters.join(','));
+  if (params.categoryIds) qs.set('category_ids', params.categoryIds);
   if (liveAuctions) qs.set('sort', 'endingSoonest');
   return `${EBAY_SEARCH_URL}?${qs.toString()}`;
 }

@@ -202,9 +202,43 @@ test('specs behind a still-live auction are fetched before specs whose auctions 
     seedListing(db, noEndDate); // no price observation at all
 
     const targets = selectEbayMatchedTargets(db);
-    // Live auctions first, soonest-ending first; specs with no future auction
-    // (ended or unknown) fall to the back, in their prior release-order.
+    // Default: ordering only. Live auctions first, soonest-ending first; specs
+    // with no future auction (ended or unknown) fall to the back, in their
+    // prior release-order -- but they are still returned.
     assert.deepEqual(targets.selections.map((s) => s.psaSpecId), [600003, 600004, 600002, 600001]);
+
+    // activeOnly: specs whose every matched listing has ended (600001) or has
+    // no known end date (600002) are dropped entirely -- an unattended fetch
+    // loop must never spend PSA quota on auctions it cannot show.
+    const active = selectEbayMatchedTargets(db, { activeOnly: true });
+    assert.deepEqual(active.selections.map((s) => s.psaSpecId), [600003, 600004]);
+  });
+});
+
+test('snapshotPsaTargets with activeOnly writes no target for an all-ended variant', async () => {
+  await withDb((db) => {
+    const live = seedVariant(db, 'base1', '1999-01-09', '4');
+    seedSpec(db, live, '600001');
+    seedListing(db, live, { itemEndDate: '2027-01-01T00:00:00.000Z' });
+
+    const ended = seedVariant(db, 'base1', '1999-01-09', '15');
+    seedSpec(db, ended, '600002');
+    seedListing(db, ended, { itemEndDate: '2020-01-01T00:00:00.000Z' });
+
+    const runId = createPipelineRun(db, {
+      queries: ['pikachu psa 10'], marketplaces: ['de'], maxItems: 0, pageLimit: 200,
+      concurrency: 1, psaMaxAgeDays: 7, salesAuditDays: 30, allSales: true,
+    });
+    const snapshot = snapshotPsaTargets(db, runId, { activeOnly: true });
+    assert.deepEqual(snapshot.selections.map((s) => s.psaSpecId), [600001]);
+
+    // Legacy default (no activeOnly) still freezes both, unchanged.
+    const legacyRun = createPipelineRun(db, {
+      queries: ['pikachu psa 10'], marketplaces: ['de'], maxItems: 0, pageLimit: 200,
+      concurrency: 1, psaMaxAgeDays: 7, salesAuditDays: 30, allSales: true,
+    });
+    const legacy = snapshotPsaTargets(db, legacyRun);
+    assert.deepEqual(legacy.selections.map((s) => s.psaSpecId).sort(), [600001, 600002]);
   });
 });
 

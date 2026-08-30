@@ -161,18 +161,30 @@ export function markFailed(db: DatabaseSync, item: WorkItemRow, error: string, r
   }
 }
 
-/** Used by `retry-failed --all`: gives up-for-good items another chance. */
-export function resetPermanentFailures(db: DatabaseSync, source?: string, queue?: string): number {
+/**
+ * Used by `retry-failed --all` and `pipeline retry`: gives up-for-good items
+ * another chance. `scopePrefix` narrows the reset to one stage / spec (e.g.
+ * `enrichment:sales:spec=12345`) using the same LIKE-escaping as
+ * `cancelByScopePrefix` so a resume can un-stick exactly one item.
+ */
+export function resetPermanentFailures(
+  db: DatabaseSync,
+  filters: { source?: string; queue?: string; scopePrefix?: string } = {},
+): number {
   const now = new Date().toISOString();
   const clauses = [`state='permanent_failed'`];
   const params: SQLInputValue[] = [];
-  if (source) {
+  if (filters.source) {
     clauses.push('source=?');
-    params.push(source);
+    params.push(filters.source);
   }
-  if (queue) {
+  if (filters.queue) {
     clauses.push('queue=?');
-    params.push(queue);
+    params.push(filters.queue);
+  }
+  if (filters.scopePrefix) {
+    clauses.push(`scope_key LIKE ? ESCAPE '\\'`);
+    params.push(`${filters.scopePrefix.replace(/[%_\\]/g, (c) => `\\${c}`)}%`);
   }
   const result = db
     .prepare(

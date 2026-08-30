@@ -12,12 +12,19 @@
 
 .PARAMETER NoWeb
     Only bootstrap (install + migrate); don't start the web server.
+
+.PARAMETER Pipeline
+    Also start the pipeline supervisor daemon in a background window
+    (`npm run cli -- pipeline start`). It watches the managed eBay search
+    terms and advances every downstream stage continuously. Stop it with
+    `npm run cli -- pipeline stop`.
 #>
 param(
     [switch]$SkipInstall,
     [ValidateSet('dev', 'prod')]
     [string]$Web = 'dev',
-    [switch]$NoWeb
+    [switch]$NoWeb,
+    [switch]$Pipeline
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +48,13 @@ if (-not $SkipInstall) {
 # 2. Run DB migration (creates data/ and db.sqlite if missing, no-op otherwise)
 Write-Step 'Running database migration...'
 npm run migrate
+
+# 2b. Optionally start the pipeline supervisor in its own window
+if ($Pipeline) {
+    Write-Step 'Starting pipeline supervisor (background window)...'
+    Start-Process -FilePath 'node' -ArgumentList 'src/cli/index.ts', 'pipeline', 'start' -WorkingDirectory $PSScriptRoot
+    Write-Host '    Stop it later with: npm run cli -- pipeline stop' -ForegroundColor DarkGray
+}
 
 if ($NoWeb) {
     Write-Step 'Bootstrap complete (NoWeb set, not starting the web server).'

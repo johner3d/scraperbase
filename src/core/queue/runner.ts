@@ -180,6 +180,13 @@ export interface RunQueueOptions {
   cooldown?: { afterConsecutiveFailures: number; cooldownMs: number };
   /** Stop claiming fresh work after the first upstream rate-limit response. */
   haltOnRateLimit?: boolean;
+  /**
+   * Stop claiming fresh work once this many items have been processed in this
+   * call (across all workers). Lets the supervisor run a bounded slice of a
+   * queue per tick instead of draining it fully. Items already in flight still
+   * finish; the rest stay pending for the next call.
+   */
+  maxItems?: number;
   /** Optional hook after each item commits, used for incremental downstream materialization. */
   onItemComplete?: (result:CollectorOutcome,item:WorkItemRow)=>Promise<void>|void;
 }
@@ -201,9 +208,11 @@ export async function runQueue(db: DatabaseSync, opts: RunQueueOptions): Promise
   let activeCount = 0;
   let consecutiveFailures = 0;
   let haltedByRateLimit = false;
+  let processed = 0;
 
   async function worker(): Promise<void> {
     while (!opts.isDraining() && !haltedByRateLimit) {
+      if (opts.maxItems != null && processed >= opts.maxItems) return;
       db.prepare('UPDATE runs SET heartbeat_at = ? WHERE run_id = ?').run(new Date().toISOString(), opts.runId);
       const item = claimNext(db, opts.queue, leaseOwner, opts.leaseTtlMs, {
         entityTypes: opts.entityTypes,
@@ -216,6 +225,7 @@ export async function runQueue(db: DatabaseSync, opts: RunQueueOptions): Promise
         continue;
       }
       activeCount++;
+      processed++;
       try {
         const result = await processItem(db, item, opts.collector, { runId: opts.runId });
         if (opts.onItemComplete) await opts.onItemComplete(result,item);

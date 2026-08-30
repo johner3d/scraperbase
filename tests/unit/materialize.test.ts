@@ -440,6 +440,40 @@ test('matches a PSA-10 eBay listing to its variant and tracks price history idem
   }
 });
 
+test('incremental materialize touches only the named eBay listing and leaves others alone', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-incremental-'));
+  const db = openDb(path.join(root, 'db.sqlite'));
+  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
+  try {
+    const variantId = seedCardVariant(db, { language: 'ja', sourceSetId: 'SV-P', setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu', dexId: 25 });
+    const runId = createRun(db, 'ebay-incremental-fixture', {});
+    await addEbayItemObservation(db, dirs, runId, 'de', '206485945782', psa10DeListing());
+    await addEbayItemObservation(db, dirs, runId, 'de', '999999999999', psa10DeListing({ itemId: 'v1|999999999999|0', legacyItemId: '999999999999', itemWebUrl: 'https://www.ebay.de/itm/999999999999' }));
+
+    // Full pass materializes both.
+    const full = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
+    assert.equal(full.ebayListings, 2);
+    const before = db.prepare(`SELECT item_id, last_seen_at FROM ebay_listings ORDER BY item_id`).all() as Array<{ item_id: string; last_seen_at: string }>;
+
+    // A new observation for just one item; incremental pass re-materializes only it.
+    await addEbayItemObservation(db, dirs, runId, 'de', '206485945782', psa10DeListing({ price: { value: '150.00', currency: 'EUR' } }), '2026-09-01T00:00:00.000Z');
+    const inc = await materialize(db, {
+      includeTcgdex: false, includePsa: false, ebayDirs: dirs,
+      incremental: true, changedEbayScopeKeys: new Set(['item:de:206485945782']),
+      now: '2026-09-01T12:00:00.000Z',
+    });
+    assert.equal(inc.ebayListings, 1, 'only the one changed listing is processed');
+
+    const after = db.prepare(`SELECT item_id, last_seen_at FROM ebay_listings ORDER BY item_id`).all() as Array<{ item_id: string; last_seen_at: string }>;
+    assert.equal(after.find((r) => r.item_id === '999999999999')!.last_seen_at, before.find((r) => r.item_id === '999999999999')!.last_seen_at, 'untouched listing unchanged');
+    assert.notEqual(after.find((r) => r.item_id === '206485945782')!.last_seen_at, before.find((r) => r.item_id === '206485945782')!.last_seen_at, 'changed listing re-materialized');
+    assert.equal((db.prepare(`SELECT COUNT(*) n FROM ebay_listing_price_observations`).get() as { n: number }).n, 3);
+  } finally {
+    db.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('skips non-PSA-10 graded eBay listings and records multi-card lots without queueing them', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-skip-'));
   const db = openDb(path.join(root, 'db.sqlite'));

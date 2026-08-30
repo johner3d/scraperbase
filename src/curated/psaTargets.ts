@@ -29,6 +29,18 @@ export interface MatchedTargetOptions {
   liveAuctionsOnly?: boolean;
   /** Cap applied to the deduplicated, ordered spec list. */
   limit?: number | null;
+  /**
+   * Drop specs whose every matched listing has already ended. PSA facts are
+   * only useful to a listing while it is still sellable, so an unattended
+   * fetch loop must never spend quota on auctions that are already history.
+   */
+  activeOnly?: boolean;
+  /**
+   * Margin added to "now" when deciding live-ness (default 30). A spec fetched
+   * now is still useful to a listing that closes a little later, and it hedges
+   * against a slightly stale `item_end_date`.
+   */
+  activeMarginMinutes?: number;
 }
 
 export interface UnresolvedSet {
@@ -83,6 +95,16 @@ function listingClauses(options: MatchedTargetOptions): { sql: string; params: s
 
 export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTargetOptions = {}): MatchedTargets {
   const { sql: where, params } = listingClauses(options);
+  const margin = Number.isFinite(options.activeMarginMinutes) ? Number(options.activeMarginMinutes) : 30;
+  // `?`-bound so the margin can't inject SQL; consumed once per query it appears in.
+  const activeExpr = `lp.item_end_date > datetime('now', printf('+%d minutes', CAST(? AS INTEGER)))`;
+  const havingActive = options.activeOnly ? `HAVING MAX(CASE WHEN ${activeExpr} THEN 1 ELSE 0 END) = 1` : '';
+  const specParams = options.activeOnly ? [...params, margin] : params;
+  const unresolvedActiveJoin = options.activeOnly
+    ? 'LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id = e.ebay_listing_id'
+    : '';
+  const unresolvedActiveClause = options.activeOnly ? `AND ${activeExpr}` : '';
+  const unresolvedParams = options.activeOnly ? [...params, margin] : params;
 
   // GROUP BY ps.spec_id is the deduplication: 2,746 matched listings collapse
   // to one fetch per spec. COUNT(DISTINCT ...) reports what is behind them.
@@ -109,8 +131,9 @@ export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTarge
     LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id = e.ebay_listing_id
     WHERE ${where}
     GROUP BY ps.spec_id
+    ${havingActive}
     ORDER BY (nextFutureEnd IS NULL) ASC, nextFutureEnd ASC, s.release_date, s.source_set_id, c.local_sort_key, ps.spec_id
-  `).all(...params) as unknown as SpecRow[];
+  `).all(...specParams) as unknown as SpecRow[];
 
   const unresolvedRows = db.prepare(`
     SELECT s.source_set_id AS sourceSetId, s.release_date AS releaseDate,
@@ -119,13 +142,15 @@ export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTarge
     JOIN variants v ON v.variant_id = e.variant_id
     JOIN cards c ON c.card_id = v.card_id
     JOIN sets s ON s.set_id = c.set_id
+    ${unresolvedActiveJoin}
     WHERE ${where}
+      ${unresolvedActiveClause}
       AND NOT EXISTS (
         SELECT 1 FROM psa_specs ps WHERE ps.variant_id = e.variant_id AND ps.namespace = 'population'
       )
     GROUP BY s.source_set_id
     ORDER BY variants DESC, s.source_set_id
-  `).all(...params) as unknown as UnresolvedSet[];
+  `).all(...unresolvedParams) as unknown as UnresolvedSet[];
 
   const limited = options.limit == null ? rows : rows.slice(0, options.limit);
   const selections: Selection[] = limited.map((row) => {

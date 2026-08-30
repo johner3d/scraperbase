@@ -50,6 +50,11 @@ const EXPECTED_TABLES = [
   'pipeline_psa_target_listings',
   'pipeline_psa_coverage',
   'pipeline_psa_manifest_revisions',
+  'ebay_search_terms',
+  'pipeline_stage_status',
+  'pipeline_dead_letters',
+  'materialize_dirty',
+  'pipeline_supervisor_state',
 ];
 
 test('openDb creates every table and is idempotent across repeated opens', async () => {
@@ -68,7 +73,7 @@ test('openDb creates every table and is idempotent across repeated opens', async
     const db2 = openDb(dbPath);
     try {
       const version = db2.prepare('PRAGMA user_version').get() as { user_version: number };
-      assert.equal(version.user_version, 12);
+      assert.equal(version.user_version, 13);
     } finally {
       db2.close();
     }

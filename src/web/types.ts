@@ -332,3 +332,42 @@ export interface PublicationStatus {
   completeness:'partial'|'complete';
   incompleteReason:string|null;
 }
+
+export interface StageStatusView {
+  stage:string;
+  state:string;
+  queueDepth:number;
+  inFlight:number;
+  retryable:number;
+  permanentFailed:number;
+  doneTotal:number;
+  deadLetterOpen:number;
+  throughputPerMin:number;
+  lastActivityAt:string|null;
+  nextEligibleAt:string|null;
+  note:string|null;
+}
+
+export interface TermFunnelView {
+  searchTermId:number;
+  query:string;
+  marketplace:string;
+  buyingOption:string;
+  enabled:boolean;
+  lastCompletedAt:string|null;
+  lastResultCount:number|null;
+  funnel:{found:number;detailed:number;matched:number;psaTargetedLive:number;population:number;guide:number;sales:number};
+}
+
+export interface SupervisorStatusView {
+  running:boolean;
+  runId:string|null;
+  startedAt:string|null;
+  publishDirty:boolean;
+  lastPublishAt:string|null;
+  quota:{used:number;limit:number;allowance:number;resumeAfter:string;paused:boolean};
+  stages:StageStatusView[];
+  terms:TermFunnelView[];
+  deadLetters:Array<{stage:string;scopeKey:string;reason:string;lastSeenAt:string}>;
+  activePauses:Array<{stage:string;source:string;reason:string;resumeAfter:string|null}>;
+}

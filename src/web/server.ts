@@ -10,6 +10,7 @@ import { createServer as createViteServer, type ViteDevServer } from 'vite';
 import { DB_PATH, MEDIA_CACHE_DIR, OBJECTS_DIR } from '../core/config/config.ts';
 import { resolvePublishedDatabase, resolvePublishedManifest } from '../pipeline/publication.ts';
 import { getAuction, getAuctionFacets, getCard, getFacets, getHealth, getMarket, getPopulation, getVariant, listAuctions, listCards, listMatchReviews, listSources, listVariants, listEbayListings, listPipelines, getPipeline } from './api.ts';
+import { supervisorStatus } from '../pipeline/supervisorStatus.ts';
 import { safeStoredPath } from './mediaPath.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -63,7 +64,7 @@ class PublishedDb {
 
 export function isOperationalApiPath(pathname:string):boolean {
   return pathname==='/api/pipelines'||pathname.startsWith('/api/pipelines/')||pathname==='/api/sources'
-    ||pathname==='/api/reviews'||pathname==='/api/ebay-listings';
+    ||pathname==='/api/reviews'||pathname==='/api/ebay-listings'||pathname==='/api/pipeline-status';
 }
 
 async function apiHandler(publishedDb: DatabaseSync, operationalDb:DatabaseSync, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
@@ -85,6 +86,7 @@ async function apiHandler(publishedDb: DatabaseSync, operationalDb:DatabaseSync,
     if (url.pathname === '/api/auctions') { json(res, 200, listAuctions(db, url.searchParams)); return true; }
     if (url.pathname === '/api/ebay-listings') { json(res, 200, listEbayListings(db, url.searchParams)); return true; }
     if (url.pathname === '/api/pipelines') { json(res, 200, {items:listPipelines(db)}); return true; }
+    if (url.pathname === '/api/pipeline-status') { json(res, 200, supervisorStatus(db)); return true; }
     if (url.pathname === '/api/auction-facets') { json(res, 200, getAuctionFacets(db)); return true; }
     if (url.pathname === '/api/sources') { json(res, 200, { items: listSources(db) }); return true; }
     if (url.pathname === '/api/facets') { json(res, 200, getFacets(db)); return true; }

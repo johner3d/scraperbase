@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import type { AuctionDetail, AuctionFacetsData, AuctionPageData, AuctionSearchItem, CardDetail, CardSearchItem, FacetsData, HealthData, MarketData, MatchReviewItem, Page, PopulationData, SaleRow, SourceStatus, VariantDetail, VariantSearchItem, EbayListingItem, EbayListingPageData, CoverageStatus, PipelineListItem, PublicationStatus } from '../../src/web/types.ts';
+import type { AuctionDetail, AuctionFacetsData, AuctionPageData, AuctionSearchItem, CardDetail, CardSearchItem, FacetsData, HealthData, MarketData, MatchReviewItem, Page, PopulationData, SaleRow, SourceStatus, VariantDetail, VariantSearchItem, EbayListingItem, EbayListingPageData, CoverageStatus, PipelineListItem, PublicationStatus, SupervisorStatusView } from '../../src/web/types.ts';
 
 const API = '/api';
 const languages = [['', 'All languages'], ['en', 'English'], ['de', 'German'], ['ja', 'Japanese']];
@@ -268,7 +268,49 @@ function VariantDetailPage() {
 function MetadataTable({ variant }: { variant: VariantDetail }) { const values: Array<[string, unknown]> = [['Category', variant.relatedCard.category], ['Rarity', variant.relatedCard.rarity], ['Illustrator', variant.cardAttributes.illustrator ?? variant.cardAttributes.artist], ['Card size', variant.cardAttributes.cardSize ?? variant.cardAttributes.size], ['Stamps', variant.attributes.stamps ?? variant.attributes.stamp]]; return <div className="metadata-table">{values.filter(([, value]) => value != null).map(([key, value]) => <div key={key}><span>{key}</span><strong>{String(value)}</strong></div>)}</div>; }
 function SourceEvidence({ variant }: { variant: VariantDetail }) { return <div className="metadata-table source-evidence"><div><span>Variant key</span><strong>{variant.variantKey}</strong></div><div><span>Matched sources</span><strong>{variant.matchedSourceCount}</strong></div>{variant.sourceReferences.map((source) => <div key={`${source.source}:${source.namespace}:${source.sourceKey}`}><span>{source.source} · {source.namespace}</span><strong>{source.sourceKey} · {humanLabel(source.status)}</strong></div>)}</div>; }
 
-function PipelinesPage(){const data=useFetch<{items:PipelineListItem[]}>(`${API}/pipelines`,15000);return <Shell><div className="page sources-page"><div className="page-heading"><div><h1>Pipeline runs</h1><p>Read-only acquisition, quota and publication status.</p></div></div>{data.loading?<div className="skeleton"/>:data.error?<ErrorState error={data.error}/>:<div className="pipeline-run-list">{data.data?.items.map((run)=><article className="pipeline-run" key={run.pipelineRunId}><div><span className={`status-dot ${run.status}`}>{run.status}</span><h3>{run.activeStage??'Complete'}</h3><p>{formatDateTime(run.startedAt)} · {run.pipelineRunId}</p>{run.progress&&<p className="pipeline-progress">PSA cert: {run.progress.psaCert.succeeded} done · {run.progress.psaCert.pending} pending · {run.progress.psaCert.retryableFailed} retrying · eBay details: {run.progress.ebay.detailFetched} fetched / {run.progress.ebay.detailPending} pending · last write {formatDateTime(run.progress.latestAttemptAt)}</p>}</div>{run.pause?<div className="pipeline-pause"><strong>{run.pause.source} paused</strong><span>{run.pause.reason}</span><small>{run.pause.resumeAfter?`Resume after ${formatDateTime(run.pause.resumeAfter)}`:'Resume when the upstream source is ready'}</small></div>:<span>{formatDateTime(run.endedAt)}</span>}</article>)}</div>}</div></Shell>}
+function countdown(iso:string|null,now:number):string{if(!iso)return'';const ms=new Date(iso).getTime()-now;if(ms<=0)return'now';const m=Math.floor(ms/60000);return m>=60?`${Math.floor(m/60)}h ${m%60}m`:m>=1?`${m}m`:`${Math.floor(ms/1000)}s`}
+function StageCard({stage,now}:{stage:SupervisorStatusView['stages'][number];now:number}){
+  return <article className="source-card"><div className="source-card-heading"><h2>{stage.stage}</h2><span className={`status-dot ${stage.state==='working'?'ok':stage.state==='stalled'||stage.state==='backing_off'?'error':stage.state==='paused'?'error':'unknown'}`}>{stage.state}</span></div>
+    <div className="source-stat"><span>Queue / in-flight</span><strong>{stage.queueDepth.toLocaleString()} / {stage.inFlight}</strong></div>
+    <div className="source-stat"><span>Done (total)</span><strong>{stage.doneTotal.toLocaleString()}</strong></div>
+    <div className="source-stat"><span>Throughput</span><strong>{stage.throughputPerMin}/min</strong></div>
+    <div className="source-stat"><span>Last activity</span><strong>{stage.lastActivityAt?formatDateTime(stage.lastActivityAt):'—'}</strong></div>
+    {stage.deadLetterOpen>0&&<p className="unresolved">{stage.deadLetterOpen} dead-letter(s)</p>}
+    {stage.nextEligibleAt&&<p className="pipeline-progress">next tick in {countdown(stage.nextEligibleAt,now)}</p>}
+    {stage.note&&<p className="tile-meta">{stage.note}</p>}
+  </article>;
+}
+function PipelinesPage(){
+  const status=useFetch<SupervisorStatusView>(`${API}/pipeline-status`,5000);
+  const runs=useFetch<{items:PipelineListItem[]}>(`${API}/pipelines`,15000);
+  const now=useMinuteNow();
+  const s=status.data;
+  return <Shell><div className="page sources-page"><div className="page-heading"><div><h1>Pipeline</h1><p>Live stage status. Control it from the CLI: <code>npm run cli -- pipeline start</code> / <code>status</code> / <code>terms</code>.</p></div>
+    {s&&<span className={`status-dot ${s.running?'ok':'unknown'}`}>{s.running?'running':'stopped'}</span>}</div>
+    {status.loading&&!s?<div className="loading-stack"><div className="skeleton"/><div className="skeleton"/></div>:status.error&&!s?<ErrorState error={status.error}/>:s?<>
+      <div className="pipeline-funnel">
+        <Metric label="eBay quota" value={`${s.quota.used} / ${s.quota.limit}`} note={`resets ${formatDateTime(s.quota.resumeAfter)}`}/>
+        <Metric label="Publish" value={s.publishDirty?'pending':'clean'} note={s.lastPublishAt?`last ${formatDateTime(s.lastPublishAt)}`:'never'}/>
+        <Metric label="Dead-letters" value={String(s.deadLetters.length)}/>
+        <Metric label="Search terms" value={String(s.terms.length)} note={`${s.terms.filter((t)=>t.enabled).length} enabled`}/>
+      </div>
+      {s.activePauses.length>0&&<div className="pipeline-pause"><strong>Paused</strong>{s.activePauses.map((p)=><span key={p.stage}>[{p.stage}] {p.reason}</span>)}</div>}
+      <h2 className="filter-group-title">Stages</h2>
+      <div className="source-grid">{s.stages.map((stage)=><StageCard stage={stage} now={now} key={stage.stage}/>)}</div>
+      {s.terms.length>0&&<><h2 className="filter-group-title">Search-term funnels</h2>
+        <div className="table-wrap"><table><thead><tr><th>Term</th><th>Found</th><th>Detailed</th><th>Matched</th><th>PSA live</th><th>Pop</th><th>Guide</th><th>Sales</th><th>Last run</th></tr></thead>
+        <tbody>{s.terms.map((t)=><tr key={t.searchTermId}><td>{t.enabled?'':'(off) '}{t.query} · {t.marketplace}/{t.buyingOption}</td>
+          <td>{t.funnel.found}</td><td>{t.funnel.detailed}</td><td>{t.funnel.matched}</td><td>{t.funnel.psaTargetedLive}</td>
+          <td>{t.funnel.population}</td><td>{t.funnel.guide}</td><td>{t.funnel.sales}</td><td>{t.lastCompletedAt?formatDate(t.lastCompletedAt):'never'}</td></tr>)}</tbody></table></div></>}
+      {s.deadLetters.length>0&&<><h2 className="filter-group-title">Dead-letters</h2>
+        <section className="health-panel"><p className="materialize-help">Clear with: <code>npm run cli -- pipeline retry --stage &lt;stage&gt; [--scope &lt;prefix&gt;]</code></p>
+        <div className="table-wrap"><table><thead><tr><th>Stage</th><th>Scope</th><th>Reason</th><th>Last seen</th></tr></thead>
+        <tbody>{s.deadLetters.map((d,i)=><tr key={i}><td>{d.stage}</td><td><code>{d.scopeKey}</code></td><td>{d.reason}</td><td>{formatDateTime(d.lastSeenAt)}</td></tr>)}</tbody></table></div></section></>}
+    </>:null}
+    {runs.data&&runs.data.items.length>0&&<><h2 className="filter-group-title">Recent pipeline runs</h2>
+      <div className="pipeline-run-list">{runs.data.items.slice(0,10).map((run)=><article className="pipeline-run" key={run.pipelineRunId}><div><span className={`status-dot ${run.status}`}>{run.status}</span><h3>{run.activeStage??'Complete'}</h3><p>{formatDateTime(run.startedAt)} · {run.pipelineRunId}</p></div>{run.pause?<div className="pipeline-pause"><strong>{run.pause.source} paused</strong><span>{run.pause.reason}</span></div>:<span>{formatDateTime(run.endedAt)}</span>}</article>)}</div></>}
+  </div></Shell>;
+}
 
 function SourcesPage() {
   const sources = useFetch<{ items: SourceStatus[] }>(`${API}/sources`), health = useFetch<HealthData>(`${API}/health`), reviews=useFetch<{items:MatchReviewItem[]}>(`${API}/reviews`);

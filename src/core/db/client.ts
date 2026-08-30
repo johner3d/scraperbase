@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -94,5 +94,10 @@ function migrate(db: DatabaseSync): void {
   if (version < 12) {
     db.exec(readFileSync(path.join(__dirname, 'schema_v12.sql'), 'utf8'));
     db.exec('PRAGMA user_version = 12');
+    version = 12;
+  }
+  if (version < 13) {
+    db.exec(readFileSync(path.join(__dirname, 'schema_v13.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 13');
   }
 }

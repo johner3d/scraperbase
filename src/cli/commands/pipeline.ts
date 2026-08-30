@@ -1,6 +1,9 @@
 import { parseArgs } from 'node:util';
 import { openCliDb } from '../context.ts';
 import { pipelineReviewCommand } from './pipeline-review.ts';
+import { pipelineTermsCommand } from './pipeline-terms.ts';
+import { pipelineDeadLetterCommand, pipelineFailuresCommand, pipelineRetryCommand } from './pipeline-failures.ts';
+import { pipelinePublishCommand, pipelineStartCommand, pipelineStatusCommand, pipelineStopCommand, pipelineTickCommand } from './pipeline-supervisor.ts';
 import { createPipelineRun, loadPipelineRun, resumePipelineRun, stageReport } from '../../pipeline/store.ts';
 import { executeExistingPsaRefresh, executePipeline, pipelineDryRun, PipelinePausedError } from '../../pipeline/orchestrator.ts';
 import type { PipelineConfig } from '../../pipeline/types.ts';
@@ -28,6 +31,16 @@ function parseRun(args:string[]):{config:PipelineConfig;dryRun:boolean;json:bool
 export async function pipelineCommand(args:string[]):Promise<void>{
   const [subcommand,...rest]=args;
   if(subcommand==='review'){await pipelineReviewCommand(rest);return;}
+  if(subcommand==='terms'){await pipelineTermsCommand(rest);return;}
+  if(subcommand==='failures'){await pipelineFailuresCommand(rest);return;}
+  if(subcommand==='retry'){await pipelineRetryCommand(rest);return;}
+  if(subcommand==='dead-letter'){await pipelineDeadLetterCommand(rest);return;}
+  if(subcommand==='start'){await pipelineStartCommand(rest);return;}
+  if(subcommand==='stop'){await pipelineStopCommand();return;}
+  if(subcommand==='tick'){await pipelineTickCommand(rest);return;}
+  if(subcommand==='status'){await pipelineStatusCommand(rest);return;}
+  if(subcommand==='publish'){await pipelinePublishCommand(rest);return;}
+  if(subcommand==='psa-login'){const {psaLoginCommand}=await import('./psa-login.ts');await psaLoginCommand(rest);return;}
   if(subcommand==='run'){
     const parsed=parseRun(rest);if(parsed.dryRun){print(pipelineDryRun(parsed.config),parsed.json);return;}
     const db=openCliDb();const id=createPipelineRun(db,parsed.config);db.close();
@@ -48,10 +61,10 @@ export async function pipelineCommand(args:string[]):Promise<void>{
     const db=openCliDb();const id=createPipelineRun(db,config);db.close();
     console.log(`PSA refresh run: ${id}`);await executeExistingPsaRefresh(id,config);print({pipelineRunId:id,status:'completed'},Boolean(values.json));return;
   }
-  if(subcommand==='status'||subcommand==='report'){
+  if(subcommand==='report'){
     const {values}=parseArgs({args:rest,options:{run:{type:'string'},json:{type:'boolean',default:false}}});const db=openCliDb();
     let id=String(values.run??'');if(!id){const row=db.prepare('SELECT pipeline_run_id FROM pipeline_runs ORDER BY created_at DESC LIMIT 1').get() as {pipeline_run_id:string}|undefined;id=row?.pipeline_run_id??'';}
     if(!id){db.close();throw new Error('No pipeline runs exist');}const report=stageReport(db,id);db.close();print(report,Boolean(values.json));return;
   }
-  throw new Error('Usage: pipeline <run|resume|refresh-psa|status|report|review>');
+  throw new Error('Usage: pipeline <start|stop|tick|status|publish|run|resume|refresh-psa|report|review|terms|failures|retry|dead-letter>');
 }

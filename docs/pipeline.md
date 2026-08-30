@@ -1,6 +1,65 @@
 # Professional data pipeline
 
-The production workflow is a durable parent run over the existing raw collectors and curated materializer:
+## Supervisor (default operating mode)
+
+The normal way to run the pipeline is the long-lived **supervisor daemon**. It watches a
+persistent list of eBay search terms and advances every downstream stage independently, a
+bounded slice per tick, publishing continuously — so matched auctions and PSA data appear in
+the app within a minute or two instead of after a multi-hour batch.
+
+```text
+# one-time: sign in the PSA browser profile
+npm run cli -- pipeline psa-login
+
+# manage the eBay searches (targeted = fewer wasted eBay calls)
+npm run cli -- pipeline terms add --query "charizard psa 10" --marketplace de
+npm run cli -- pipeline terms add --query "base set psa 10" --marketplace eu \
+  --buying-option auction --min-bids 3 --ending-within 48h \
+  --price-min 50 --price-max 4000 --category 183454 --refresh 20m --priority 10
+npm run cli -- pipeline terms list
+npm run cli -- pipeline terms test <id>        # dry run: result count + estimated item-detail calls, fetches nothing
+npm run cli -- pipeline terms set <id> --min-bids 1
+npm run cli -- pipeline terms enable|disable|remove <id|query>
+
+# run it
+npm run cli -- pipeline start                  # the daemon (add to start.ps1 with -Pipeline)
+npm run cli -- pipeline start --stages ingest,ebay-match,psa-cert
+npm run cli -- pipeline start --retry-failed   # clear all dead-letters on startup
+npm run cli -- pipeline stop                   # drains in-flight work, then exits (Ctrl+C also works)
+npm run cli -- pipeline tick [all|<stage>]     # one bounded pass, then exit (for Task Scheduler / debugging)
+
+# observe
+npm run cli -- pipeline status [--watch] [--json]   # stage strip + quota + per-term funnels
+#   also live at /pipelines in the web UI (read-only)
+
+# failures
+npm run cli -- pipeline failures [--stage <s>]
+npm run cli -- pipeline retry --stage <s> [--scope <prefix>] [--all]
+npm run cli -- pipeline dead-letter resolve --stage <s> --scope <key>   # won't-fix
+
+# force a publication now
+npm run cli -- pipeline publish --now
+```
+
+Supervisor stages: `ingest -> ebay-match -> psa-cert -> psa-identity -> psa-fetch -> publish`,
+plus a daily `reconcile` full rebuild that heals any incremental drift. Each stage:
+
+- does a bounded unit of work per tick and commits per item (no batch handoff),
+- backs itself off when there's nothing to do,
+- sends a permanently-failed item to a **visible dead-letter** and keeps going (one bad spec
+  never aborts the pipeline),
+- has a watchdog so a slow stage can't block the others.
+
+`psa-fetch` only ever targets auctions that are **still live**, soonest-closing first — ended
+auctions never cost PSA quota. eBay `auction` search terms fetch an item-detail call only for
+listings with real bids ending inside the window.
+
+Only one writer at a time: `pipeline start` and the one-shot `pipeline run` below are mutually
+exclusive (the loser fails fast with "Another writer is active").
+
+## One-shot run (CI / recovery)
+
+The original sequential run is still available for a single controlled pass:
 
 ```text
 npm run cli -- pipeline run --query "pikachu psa 10" --marketplaces de

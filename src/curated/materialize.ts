@@ -25,6 +25,17 @@ export interface MaterializeOptions {
   includeEcb?: boolean;
   now?: string;
   pipelineRunId?: string;
+  /**
+   * Incremental mode: only re-materialize the named eBay listings / PSA specs
+   * instead of the whole corpus, and skip whole-table passes (tcgdex, cluster
+   * propagation, PSA native identity crawl). The supervisor uses this per tick;
+   * the daily reconcile still does a full rebuild.
+   */
+  incremental?: boolean;
+  /** `item:<marketplace>:<id>` scope keys to re-materialize (incremental eBay). */
+  changedEbayScopeKeys?: Set<string>;
+  /** PSA population/sales spec ids to re-materialize (incremental PSA). */
+  changedPsaSpecIds?: Set<string>;
 }
 
 export interface MaterializeResult {
@@ -643,11 +654,24 @@ function upsertSales(db:DatabaseSync,data:SalesFile,specPk:number,observation:Ob
   }
   return count;
 }
-async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omit<MaterializeResult,'sets'|'cards'|'hydratedCards'|'variants'|'assets'|'localAssetsLinked'|'openReviews'|'ebayListings'|'matchedEbayListings'|'ebayPriceObservations'|'exchangeRates'>>{
-  const populations=latestFiles<PopulationFile>(root,'population',(data)=>String(data.psaSpecId));
-  const sales=latestFiles<SalesFile>(root,'sales',(data)=>String(data.salesSpecId));
-  db.prepare(`DELETE FROM match_reviews WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa') AND status='open'`).run();
-  db.prepare(`DELETE FROM source_links WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa')`).run();
+async function materializePsa(db:DatabaseSync,root:string,at:string,onlySpecIds?:Set<string>):Promise<Omit<MaterializeResult,'sets'|'cards'|'hydratedCards'|'variants'|'assets'|'localAssetsLinked'|'openReviews'|'ebayListings'|'matchedEbayListings'|'ebayPriceObservations'|'exchangeRates'>>{
+  const keep=(specId:string,salesSpecId?:string|number|null)=>!onlySpecIds||onlySpecIds.has(specId)||(salesSpecId!=null&&onlySpecIds.has(String(salesSpecId)));
+  const populations=new Map([...latestFiles<PopulationFile>(root,'population',(data)=>String(data.psaSpecId))].filter(([id,data])=>keep(id,data.salesSpecId)));
+  const sales=new Map([...latestFiles<SalesFile>(root,'sales',(data)=>String(data.salesSpecId))].filter(([id])=>keep(id)));
+  if(onlySpecIds){
+    // Incremental: touch only the affected records, not the whole PSA slice.
+    const ids=[...new Set([...populations.keys(),...sales.keys()])];
+    if(ids.length){
+      const ph=ids.map(()=>'?').join(',');
+      db.prepare(`DELETE FROM match_reviews WHERE status='open' AND source_record_id IN
+        (SELECT source_record_id FROM source_records WHERE source='psa' AND source_key IN (${ph}))`).run(...ids);
+      db.prepare(`DELETE FROM source_links WHERE source_record_id IN
+        (SELECT source_record_id FROM source_records WHERE source='psa' AND source_key IN (${ph}))`).run(...ids);
+    }
+  }else{
+    db.prepare(`DELETE FROM match_reviews WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa') AND status='open'`).run();
+    db.prepare(`DELETE FROM source_links WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa')`).run();
+  }
   // PSA identities are durable catalogue facts. A previous full DELETE made
   // the eBay-derived target set drift between fetch and import whenever the
   // native pop-report pass resolved additional specs. Upserts below refresh
@@ -1021,6 +1045,45 @@ function recordEbayDecisionRevision(db:DatabaseSync,args:{pipelineRunId?:string;
       decision.matchStatus,decision.tier,decision.score,decision.runnerUpScore,decision.reason,signals,args.at);
 }
 
+interface EbayRowContext { matcher:EbayMatcher; certVariants:Map<string,CertMatch>; pipelineRunId?:string }
+
+/** Materialize one stored eBay item observation. Returns whether it produced a listing row and a price observation. */
+async function materializeEbayRow(db:DatabaseSync,at:string,dirs:ObjectStoreDirs,row:ObservationRow,ctx:EbayRowContext):Promise<{listing:boolean;matched:boolean;priceObservation:boolean}>{
+  const match=/^item:([^:]+):(.+)$/.exec(row.scope_key); if(!match) return {listing:false,matched:false,priceObservation:false};
+  const marketplace=match[1]!,itemId=match[2]!;
+  const item=await readObservationJson<EbayItemDetail>(row,dirs);
+  const record=upsertSourceRecord(db,{source:'ebay',namespace:marketplace,sourceKey:itemId,entityType:'item',language:null,observation:row,observedAt:row.observed_at});
+  const result=ctx.matcher.match(item);
+  if(!isPsa10(result.evidence.grading)){recordParser(db,row,at,{kind:'ebay-item',skipped:'not-psa-10'});return {listing:false,matched:false,priceObservation:false};}
+  // An exact identification from the slab's own certification number
+  // outranks anything inferred from the listing text.
+  const cert=result.evidence.grading.certNumber?.trim();
+  const certMatch=cert?ctx.certVariants.get(cert):undefined;
+  if(certMatch){
+    const heuristic={cardId:result.decision.cardId,variantId:result.decision.variantId,tier:result.decision.tier,score:result.decision.score};
+    result.signals.certTruth={certNumber:cert,cardId:certMatch.cardId,variantId:certMatch.variantId,
+      heuristic,conflict:(heuristic.variantId!=null&&heuristic.variantId!==certMatch.variantId)
+        ||(heuristic.cardId!=null&&heuristic.cardId!==certMatch.cardId)};
+    Object.assign(result.decision,{
+      cardId:certMatch.cardId,variantId:certMatch.variantId,tier:'exact' as const,matchStatus:'matched' as const,
+      method:'ebay-psa-cert',confidence:1,flagged:false,variantConfidence:'proven' as const,gapSubject:null,
+    });
+  }
+  if(!applyEbayOverride(db,record,result,at)){
+    if(result.decision.variantId!=null) linkSource(db,record,'variant',result.decision.variantId,result.decision.matchStatus,result.decision.method,at,result.decision.confidence);
+    else if(result.decision.cardId!=null) linkSource(db,record,'card',result.decision.cardId,result.decision.matchStatus,result.decision.method,at,result.decision.confidence);
+  }
+  const listingId=upsertEbayListing(db,{
+    sourceRecordId:record,marketplace,itemId,legacyItemId:nullableText(item.legacyItemId),itemWebUrl:nullableText(item.itemWebUrl),
+    title:valueText(item.title,itemId),grading:result.evidence.grading,result,item,at,observation:row,
+  });
+  recordEbayDecisionRevision(db,{pipelineRunId:ctx.pipelineRunId,sourceRecordId:record,observation:row,result,at});
+  if(isReviewable(result)) recordEbayReview(db,record,at,result);
+  const priceObservation=insertEbayPriceObservation(db,listingId,item,row,at);
+  recordParser(db,row,at,{kind:'ebay-item',listingId,matchStatus:result.decision.matchStatus,tier:result.decision.tier});
+  return {listing:true,matched:result.decision.cardId!=null,priceObservation};
+}
+
 async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs,pipelineRunId?:string):Promise<{listings:number;matchedListings:number;priceObservations:number;propagated:number}>{
   const rows=latestObservations(db,'item');
   // The queue is rebuilt from scratch on every run, exactly as the PSA path
@@ -1029,47 +1092,42 @@ async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs,pi
   // it. Resolved rows are history and are kept.
   db.prepare(`DELETE FROM match_reviews WHERE status='open' AND source_record_id IN
     (SELECT source_record_id FROM source_records WHERE source='ebay')`).run();
-  const matcher:EbayMatcher=createEbayMatcher(db);
-  const certVariants=await buildCertVariantMap(db,dirs);
+  const ctx:EbayRowContext={matcher:createEbayMatcher(db),certVariants:await buildCertVariantMap(db,dirs),pipelineRunId};
   let listings=0,matchedListings=0,priceObservations=0;
   for(const row of rows){
-    const match=/^item:([^:]+):(.+)$/.exec(row.scope_key); if(!match) continue;
-    const marketplace=match[1]!,itemId=match[2]!;
-    const item=await readObservationJson<EbayItemDetail>(row,dirs);
-    const record=upsertSourceRecord(db,{source:'ebay',namespace:marketplace,sourceKey:itemId,entityType:'item',language:null,observation:row,observedAt:row.observed_at});
-    const result=matcher.match(item);
-    if(!isPsa10(result.evidence.grading)){recordParser(db,row,at,{kind:'ebay-item',skipped:'not-psa-10'});continue;}
-    // An exact identification from the slab's own certification number
-    // outranks anything inferred from the listing text.
-    const cert=result.evidence.grading.certNumber?.trim();
-    const certMatch=cert?certVariants.get(cert):undefined;
-    if(certMatch){
-      const heuristic={cardId:result.decision.cardId,variantId:result.decision.variantId,tier:result.decision.tier,score:result.decision.score};
-      result.signals.certTruth={certNumber:cert,cardId:certMatch.cardId,variantId:certMatch.variantId,
-        heuristic,conflict:(heuristic.variantId!=null&&heuristic.variantId!==certMatch.variantId)
-          ||(heuristic.cardId!=null&&heuristic.cardId!==certMatch.cardId)};
-      Object.assign(result.decision,{
-        cardId:certMatch.cardId,variantId:certMatch.variantId,tier:'exact' as const,matchStatus:'matched' as const,
-        method:'ebay-psa-cert',confidence:1,flagged:false,variantConfidence:'proven' as const,gapSubject:null,
-      });
-    }
-    if(!applyEbayOverride(db,record,result,at)){
-      if(result.decision.variantId!=null) linkSource(db,record,'variant',result.decision.variantId,result.decision.matchStatus,result.decision.method,at,result.decision.confidence);
-      else if(result.decision.cardId!=null) linkSource(db,record,'card',result.decision.cardId,result.decision.matchStatus,result.decision.method,at,result.decision.confidence);
-    }
-    const listingId=upsertEbayListing(db,{
-      sourceRecordId:record,marketplace,itemId,legacyItemId:nullableText(item.legacyItemId),itemWebUrl:nullableText(item.itemWebUrl),
-      title:valueText(item.title,itemId),grading:result.evidence.grading,result,item,at,observation:row,
-    });
-    recordEbayDecisionRevision(db,{pipelineRunId,sourceRecordId:record,observation:row,result,at});
-    if(isReviewable(result)) recordEbayReview(db,record,at,result);
-    listings++;
-    if(result.decision.cardId!=null) matchedListings++;
-    if(insertEbayPriceObservation(db,listingId,item,row,at)) priceObservations++;
-    recordParser(db,row,at,{kind:'ebay-item',listingId,matchStatus:result.decision.matchStatus,tier:result.decision.tier});
+    const r=await materializeEbayRow(db,at,dirs,row,ctx);
+    if(r.listing) listings++;
+    if(r.matched) matchedListings++;
+    if(r.priceObservation) priceObservations++;
   }
   const propagated=propagateEbayClusters(db,at,pipelineRunId);
   return{listings,matchedListings:matchedListings+propagated,priceObservations,propagated};
+}
+
+/**
+ * Incremental eBay materialize: only the item observations whose source record
+ * is in `scopeKeys` (an `item:<marketplace>:<id>` set). Clears open review rows
+ * only for those records, and does NOT run the whole-table cluster propagation
+ * (that stays in the daily reconcile pass). Used by the supervisor's ebay-match
+ * tick so a handful of freshly-fetched listings reach the UI in seconds.
+ */
+async function materializeEbayIncremental(db:DatabaseSync,at:string,dirs:ObjectStoreDirs,scopeKeys:Set<string>,pipelineRunId?:string):Promise<{listings:number;matchedListings:number;priceObservations:number}>{
+  if(scopeKeys.size===0) return {listings:0,matchedListings:0,priceObservations:0};
+  const rows=latestObservations(db,'item').filter((row)=>scopeKeys.has(row.scope_key));
+  if(rows.length===0) return {listings:0,matchedListings:0,priceObservations:0};
+  const placeholders=rows.map(()=>'?').join(',');
+  db.prepare(`DELETE FROM match_reviews WHERE status='open' AND source_record_id IN
+    (SELECT sr.source_record_id FROM source_records sr WHERE sr.source='ebay'
+      AND 'item:'||sr.namespace||':'||sr.source_key IN (${placeholders}))`).run(...rows.map((r)=>r.scope_key));
+  const ctx:EbayRowContext={matcher:createEbayMatcher(db),certVariants:await buildCertVariantMap(db,dirs),pipelineRunId};
+  let listings=0,matchedListings=0,priceObservations=0;
+  for(const row of rows){
+    const r=await materializeEbayRow(db,at,dirs,row,ctx);
+    if(r.listing) listings++;
+    if(r.matched) matchedListings++;
+    if(r.priceObservation) priceObservations++;
+  }
+  return {listings,matchedListings,priceObservations};
 }
 
 async function materializeEcb(db:DatabaseSync,at:string,dirs?:ObjectStoreDirs):Promise<number>{
@@ -1093,6 +1151,18 @@ export async function materialize(db:DatabaseSync,options:MaterializeOptions={})
   const result:MaterializeResult={sets:0,cards:0,hydratedCards:0,variants:0,assets:0,localAssetsLinked:0,psaSpecs:0,populationRows:0,priceRows:0,censusRows:0,salesRows:0,matchedPsaSpecs:0,ebayListings:0,matchedEbayListings:0,ebayPriceObservations:0,exchangeRates:0,openReviews:0};
   db.exec('BEGIN IMMEDIATE');
   try{
+    if(options.incremental){
+      if(options.includePsa!==false&&options.changedPsaSpecIds&&options.changedPsaSpecIds.size>0){
+        const psa=await materializePsa(db,options.psaDir??path.join(DATA_DIR,'psa-raw'),at,options.changedPsaSpecIds);
+        Object.assign(result,psa);
+      }
+      if(options.includeEbay!==false&&options.changedEbayScopeKeys){
+        const ebay=await materializeEbayIncremental(db,at,options.ebayDirs??EBAY_RAW_DIRS,options.changedEbayScopeKeys,options.pipelineRunId);
+        result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;
+      }
+      result.openReviews=Number((db.prepare(`SELECT COUNT(*) n FROM match_reviews WHERE status='open'`).get() as {n:number}).n);
+      db.exec('COMMIT');return result;
+    }
     if(options.includeTcgdex!==false){const tcg=await materializeTcgdex(db,at,options.objectStoreDirs);result.sets=tcg.sets;result.cards=tcg.cards;result.hydratedCards=tcg.hydratedCards;result.variants=tcg.variants;result.assets=tcg.assets;result.localAssetsLinked=tcg.localAssetsLinked;}
     if(options.includePsa!==false){
       const psa=await materializePsa(db,options.psaDir??path.join(DATA_DIR,'psa-raw'),at);Object.assign(result,psa);

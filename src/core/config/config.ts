@@ -19,3 +19,11 @@ export const EBAY_RAW_DIR = path.join(DATA_DIR, 'ebay-raw');
 export const EBAY_RAW_TMP_DIR = path.join(EBAY_RAW_DIR, 'tmp');
 export const PUBLISHED_DIR = path.join(DATA_DIR, 'published');
 export const PUBLISHED_POINTER_PATH = path.join(PUBLISHED_DIR, 'current.json');
+
+// Wall-clock ceiling on any single outbound HTTP request. Without it a stalled
+// TCP connection hangs a queue worker forever, which in turn hangs its stage and
+// (in the sequential pipeline) the whole run. Overridable per call.
+export const DEFAULT_HTTP_TIMEOUT_MS = Number(process.env.SCRAPERBASE_HTTP_TIMEOUT_MS) || 20_000;
+// eBay's OAuth token endpoint is on the critical path for every eBay request; a
+// shorter ceiling keeps a token-server hiccup from masquerading as a dead queue.
+export const EBAY_TOKEN_TIMEOUT_MS = Number(process.env.SCRAPERBASE_EBAY_TOKEN_TIMEOUT_MS) || 15_000;
