@@ -21,11 +21,14 @@ export function searchPageScopeKey(
   // `endingBeforeAt` cutoff from the original params_json instead of doing
   // a fresh, correctly-windowed search.
   asOf?: string,
+  priceMin?: number,
+  priceMax?: number,
 ): string {
   const cap = maxItems === 0 ? 'all' : String(maxItems);
   const modeTag = mode === 'all' ? 'buying=all' : `mode=${mode}`;
   const asOfTag = asOf ? `:asof=${asOf}` : '';
-  return `search:${marketplace}:${query}:${modeTag}:limit=${limit}:max=${cap}:offset=${offset}${asOfTag}`;
+  const priceTag = priceMin != null || priceMax != null ? `:price=${priceMin ?? 0}-${priceMax ?? 'inf'}` : '';
+  return `search:${marketplace}:${query}:${modeTag}:limit=${limit}:max=${cap}:offset=${offset}${asOfTag}${priceTag}`;
 }
 
 /** YYYY-MM-DD from an endingBeforeAt ISO timestamp, for searchPageScopeKey's asOf. */

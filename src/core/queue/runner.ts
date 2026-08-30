@@ -178,6 +178,10 @@ export interface RunQueueOptions {
    * Undefined (the default) preserves old behavior: no pause, ever.
    */
   cooldown?: { afterConsecutiveFailures: number; cooldownMs: number };
+  /** Stop claiming fresh work after the first upstream rate-limit response. */
+  haltOnRateLimit?: boolean;
+  /** Optional hook after each item commits, used for incremental downstream materialization. */
+  onItemComplete?: (result:CollectorOutcome,item:WorkItemRow)=>Promise<void>|void;
 }
 
 const SUCCESS_FINAL_STATES: ReadonlySet<CollectorOutcome['final']> = new Set(['succeeded', 'partial']);
@@ -196,9 +200,10 @@ export async function runQueue(db: DatabaseSync, opts: RunQueueOptions): Promise
   const pollMs = opts.pollIntervalMs ?? 100;
   let activeCount = 0;
   let consecutiveFailures = 0;
+  let haltedByRateLimit = false;
 
   async function worker(): Promise<void> {
-    while (!opts.isDraining()) {
+    while (!opts.isDraining() && !haltedByRateLimit) {
       db.prepare('UPDATE runs SET heartbeat_at = ? WHERE run_id = ?').run(new Date().toISOString(), opts.runId);
       const item = claimNext(db, opts.queue, leaseOwner, opts.leaseTtlMs, {
         entityTypes: opts.entityTypes,
@@ -213,6 +218,16 @@ export async function runQueue(db: DatabaseSync, opts: RunQueueOptions): Promise
       activeCount++;
       try {
         const result = await processItem(db, item, opts.collector, { runId: opts.runId });
+        if (opts.onItemComplete) await opts.onItemComplete(result,item);
+        if (opts.haltOnRateLimit && (result.outcome === 'rate_limited' || result.httpStatus === 429)) {
+          haltedByRateLimit = true;
+          logEvent(db, {
+            runId: opts.runId,
+            level: 'warn',
+            category: 'system',
+            message: `Rate limit on queue '${opts.queue}' -- halting this queue resumably before claiming fresh work`,
+          });
+        }
         if (opts.cooldown) {
           if (SUCCESS_FINAL_STATES.has(result.final)) {
             consecutiveFailures = 0;

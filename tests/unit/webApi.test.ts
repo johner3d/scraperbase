@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { openDb } from '../../src/core/db/client.ts';
-import { getAuction, getAuctionFacets, getCard, getMarket, getPopulation, listAuctions, listCards, listSources, listVariants } from '../../src/web/api.ts';
+import { getAuction, getAuctionFacets, getCard, getMarket, getPopulation, listAuctions, listCards, listEbayListings, listSources, listVariants } from '../../src/web/api.ts';
+import { createPipelineRun } from '../../src/pipeline/store.ts';
 
 async function fixture() {
   const dir = await mkdtemp(path.join(tmpdir(), 'scraperbase-web-'));
@@ -61,6 +62,25 @@ test('PSA availability is explicit for a variant with no matched PSA source', as
     assert.equal(market.salesAvailable,false);
     assert.equal(population.available,false);
   } finally { f.db.close(); await rm(f.dir,{recursive:true,force:true}); }
+});
+
+test('campaign listing API includes the acquisition-to-PSA funnel',async()=>{
+  const f=await fixture();
+  try{
+    const now='2026-08-30T12:00:00.000Z',runId=createPipelineRun(f.db,{queries:['alakazam psa 10'],marketplaces:['de'],maxItems:0,pageLimit:200,concurrency:1,psaMaxAgeDays:7,salesAuditDays:30,allSales:true});
+    const campaign='campaign-test';f.db.prepare(`INSERT INTO ebay_campaigns(campaign_id,pipeline_run_id,query_text,normalized_query,marketplace,status,coverage_status,created_at)
+      VALUES(?,?,?,'alakazam psa 10','de','complete','complete',?)`).run(campaign,runId,'alakazam psa 10',now);
+    f.db.prepare(`INSERT INTO ebay_campaign_items(campaign_id,marketplace,item_id,first_seen_at,last_seen_at) VALUES(?,'de','item-1',?,?)`).run(campaign,now,now);
+    const record=f.db.prepare(`INSERT INTO source_records(source,namespace,source_key,entity_type,first_seen_at,last_seen_at)
+      VALUES('ebay','item','item-1','item',?,?) RETURNING source_record_id`).get(now,now) as {source_record_id:number};
+    const listing=f.db.prepare(`INSERT INTO ebay_listings(source_record_id,marketplace,item_id,title,grader,grade_value,variant_id,match_status,match_tier,flagged,first_seen_at,last_seen_at)
+      VALUES(?,'de','item-1','Alakazam PSA 10','PSA',10,?,'matched','strong',0,?,?) RETURNING ebay_listing_id`).get(record.source_record_id,f.variantId,now,now) as {ebay_listing_id:number};
+    f.db.prepare(`INSERT INTO ebay_listing_price_observations(ebay_listing_id,observed_at,price_value,price_currency,buying_options_json,bid_count,item_end_date,snapshot_fingerprint)
+      VALUES(?, ?, 100, 'EUR', '["AUCTION"]', 1, '2026-09-01T12:00:00.000Z', 'fp')`).run(listing.ebay_listing_id,now);
+    const result=listEbayListings(f.db,new URLSearchParams(`campaign=${campaign}`),new Date(now));
+    assert.equal(result.total,1);assert.equal(result.funnel.detailsFetched,1);assert.equal(result.funnel.matched,1);
+    assert.equal(result.items[0]!.psa.identity,'processed');assert.equal(result.items[0]!.psa.population,'processed');
+  }finally{f.db.close();await rm(f.dir,{recursive:true,force:true});}
 });
 
 test('newer empty PSA sales snapshots do not hide an earlier populated sales spec', async () => {

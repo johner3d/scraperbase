@@ -100,3 +100,24 @@ test('runQueue: without a cooldown option, consecutive failures never pause (unc
     assert.ok(elapsed < 2_000, `expected no cooldown pause without opts.cooldown, took ${elapsed}ms`);
   });
 });
+
+test('runQueue: haltOnRateLimit leaves fresh work pending for a later resume', async () => {
+  await withDb(async (db) => {
+    const runId = createRun(db, 'rate-limit-halt-fixture', {});
+    for (let i = 0; i < 5; i++) {
+      enqueueWorkItem(db, { source: 'test', queue: 'rate_limit_queue', entityType: 'thing', scopeKey: `item:${i}`, params: {} });
+    }
+    let calls = 0;
+    const collector: Collector = async () => {
+      calls++;
+      return { outcome: 'rate_limited', final: 'retryable_failed', sourceIdentity: 'test', httpStatus: 429 };
+    };
+    await runQueue(db, {
+      queue: 'rate_limit_queue', collector, concurrency: 1, leaseTtlMs: 60_000, runId,
+      isDraining: () => false, haltOnRateLimit: true,
+    });
+    assert.equal(calls, 1);
+    const states = db.prepare(`SELECT state,COUNT(*) n FROM work_items WHERE queue='rate_limit_queue' GROUP BY state`).all() as unknown as Array<{state:string;n:number}>;
+    assert.deepEqual(Object.fromEntries(states.map((row)=>[row.state,Number(row.n)])), { pending: 4, retryable_failed: 1 });
+  });
+});

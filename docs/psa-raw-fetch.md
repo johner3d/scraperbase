@@ -1,5 +1,7 @@
 # PSA raw fetch
 
+> Production note: `pipeline run` now schedules population, guide, and complete-history sales enrichment through durable per-spec work items. The standalone commands in this document remain compatibility and recovery tools; see [`pipeline.md`](./pipeline.md).
+
 Everything built so far for getting population and sales-history data out of
 PSA (psacard.com) for Pokemon cards. Three layers exist side by side right now:
 

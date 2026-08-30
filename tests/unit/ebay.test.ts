@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildSearchUrl, nextOffset, requestLimit, selectLiveAuctionItems, type SearchParams } from '../../src/sources/ebay/collectors/search.ts';
+import { buildSearchUrl, nextOffset, requestLimit, selectLiveAuctionItems, splitPricePartition, type SearchParams } from '../../src/sources/ebay/collectors/search.ts';
 import { itemScopeKey, liveAuctionAsOfTag, searchPageScopeKey } from '../../src/sources/ebay/scopeKeys.ts';
 
 const base: SearchParams = {
@@ -21,6 +21,18 @@ test('a cap smaller than one page reduces the request limit', () => {
   const params = { ...base, limit: 30, maxItems: 5 };
   assert.equal(requestLimit(params), 5);
   assert.match(buildSearchUrl(params), /limit=5/);
+});
+
+test('professional campaigns partition the 10k result window deterministically',()=>{
+  const first=splitPricePartition({});
+  assert.deepEqual(first[0],{priceMin:0,priceMax:25});
+  assert.deepEqual(first.at(-1),{priceMin:5000.01});
+  assert.deepEqual(splitPricePartition({priceMin:100,priceMax:200}),[
+    {priceMin:100,priceMax:150},{priceMin:150.01,priceMax:200},
+  ]);
+  const url=buildSearchUrl({...base,priceMin:25.01,priceMax:50});
+  assert.match(decodeURIComponent(url),/price:\[25\.01\.\.50\.00\]/);
+  assert.match(decodeURIComponent(url),/priceCurrency:EUR/);
 });
 
 test('search configurations and marketplace item views have distinct scope keys', () => {

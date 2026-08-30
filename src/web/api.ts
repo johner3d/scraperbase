@@ -3,6 +3,7 @@ import type {
   AuctionDetail, AuctionFacetsData, AuctionPageData, AuctionPriceObservation, AuctionSearchItem,
   CardDetail, CardSearchItem, FacetsData, FxRateMeta, HealthData, MarketData, MatchReviewItem, Page,
   PopulationData, SaleRow, SortOption, SourceStatus, VariantDetail, VariantSearchItem,
+  EbayListingItem,EbayListingPageData,PipelineListItem,CoverageStatus,
 } from './types.ts';
 
 type SqlValue = string | number | null;
@@ -399,5 +400,117 @@ export function listMatchReviews(db:DatabaseSync):MatchReviewItem[]{
       score:row.score==null?null:Number(row.score),runnerUpScore:row.runner_up_score==null?null:Number(row.runner_up_score),
       candidates,signals};
   });
+}
+
+function coverage(value:unknown,fallback:CoverageStatus):CoverageStatus{
+  const allowed=new Set<CoverageStatus>(['pending','identity_missing','raw_missing','raw_present','processed','no_data','rate_limited','failed']);
+  return allowed.has(String(value) as CoverageStatus)?String(value) as CoverageStatus:fallback;
+}
+
+export function listEbayListings(db:DatabaseSync,search:URLSearchParams,now=new Date()):EbayListingPageData{
+  const campaign=search.get('campaign'),marketplace=search.get('marketplace'),query=search.get('query');
+  const source=db.prepare(`WITH latest_price AS (
+      SELECT *,ROW_NUMBER() OVER(PARTITION BY ebay_listing_id ORDER BY observed_at DESC,ebay_price_observation_id DESC) rn
+      FROM ebay_listing_price_observations)
+    SELECT ci.campaign_id,c.pipeline_run_id,c.query_text,c.marketplace,c.status campaign_status,c.coverage_status,
+      c.resume_after,ci.item_id,w.state work_state,w.last_error,
+      e.ebay_listing_id,e.title,e.match_tier,e.match_status,e.signals_json,e.variant_id,
+      lp.price_value,lp.price_currency,lp.current_bid_price,lp.bid_count,lp.item_end_date,v.*,
+      (SELECT cov.status FROM pipeline_psa_target_listings tl
+        JOIN pipeline_psa_targets t ON t.pipeline_psa_target_id=tl.pipeline_psa_target_id
+        JOIN pipeline_psa_coverage cov ON cov.pipeline_psa_target_id=t.pipeline_psa_target_id AND cov.phase='population'
+        WHERE tl.ebay_listing_id=e.ebay_listing_id ORDER BY t.created_at DESC LIMIT 1) population_status,
+      (SELECT cov.status FROM pipeline_psa_target_listings tl
+        JOIN pipeline_psa_targets t ON t.pipeline_psa_target_id=tl.pipeline_psa_target_id
+        JOIN pipeline_psa_coverage cov ON cov.pipeline_psa_target_id=t.pipeline_psa_target_id AND cov.phase='guide'
+        WHERE tl.ebay_listing_id=e.ebay_listing_id ORDER BY t.created_at DESC LIMIT 1) guide_status,
+      (SELECT cov.status FROM pipeline_psa_target_listings tl
+        JOIN pipeline_psa_targets t ON t.pipeline_psa_target_id=tl.pipeline_psa_target_id
+        JOIN pipeline_psa_coverage cov ON cov.pipeline_psa_target_id=t.pipeline_psa_target_id AND cov.phase='sales'
+        WHERE tl.ebay_listing_id=e.ebay_listing_id ORDER BY t.created_at DESC LIMIT 1) sales_status,
+      EXISTS(SELECT 1 FROM psa_specs ps WHERE ps.variant_id=e.variant_id AND ps.namespace='population'
+        AND ps.match_status IN ('matched','manual')) has_identity,
+      EXISTS(SELECT 1 FROM psa_population_current pc JOIN psa_specs ps ON ps.psa_spec_pk=pc.population_spec_pk
+        WHERE ps.variant_id=e.variant_id AND ps.match_status IN ('matched','manual')) has_population_rows,
+      EXISTS(SELECT 1 FROM psa_price_current pc JOIN psa_specs ps ON ps.psa_spec_pk=pc.population_spec_pk
+        WHERE ps.variant_id=e.variant_id AND ps.match_status IN ('matched','manual') AND pc.grade_value=10) has_guide_rows,
+      EXISTS(SELECT 1 FROM psa_sales sx JOIN psa_specs ps ON ps.psa_spec_pk=sx.sales_spec_pk
+        WHERE ps.variant_id=e.variant_id AND ps.match_status IN ('matched','manual') AND sx.grade_value=10) has_sales_rows
+    FROM ebay_campaign_items ci JOIN ebay_campaigns c ON c.campaign_id=ci.campaign_id
+    LEFT JOIN work_items w ON w.source='ebay' AND w.queue='ebay_item_detail'
+      AND w.scope_key='item:'||ci.marketplace||':'||ci.item_id
+    LEFT JOIN ebay_listings e ON e.marketplace=ci.marketplace AND e.item_id=ci.item_id
+    LEFT JOIN latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id AND lp.rn=1
+    LEFT JOIN v_variant_search v ON v.variant_id=e.variant_id
+    WHERE (? IS NULL OR ci.campaign_id=?) AND (? IS NULL OR c.marketplace=?) AND (? IS NULL OR c.query_text=?)
+    ORDER BY ci.last_seen_at DESC,ci.item_id`).all(campaign,campaign,marketplace,marketplace,query,query) as unknown as Row[];
+  const summaries=summaryRows(db,source.map((row)=>number(row.variant_id)).filter((id):id is number=>id!=null));
+  const mapped:EbayListingItem[]=source.map((row)=>{
+    const variantId=number(row.variant_id),variant=variantId==null?null:variantItem(db,row,summaries.get(variantId));
+    const state=String(row.work_state??'pending');
+    const acquisitionStatus:EbayListingItem['acquisitionStatus']=row.ebay_listing_id!=null?'fetched':
+      /429|rate.?limit/i.test(String(row.last_error??''))?'rate_limited':state==='permanent_failed'?'failed':'pending';
+    const end=text(row.item_end_date),live=Boolean(end&&new Date(end)>now);
+    const trusted=['exact','strong'].includes(String(row.match_tier))&&integer(row.flagged)===0;
+    const identity:CoverageStatus=trusted?(integer(row.has_identity)?'processed':'identity_missing'):'identity_missing';
+    const signals=object(row.signals_json);
+    return{campaignId:String(row.campaign_id),pipelineRunId:String(row.pipeline_run_id),query:String(row.query_text),
+      marketplace:String(row.marketplace),itemId:String(row.item_id),listingId:number(row.ebay_listing_id),title:text(row.title),
+      acquisitionStatus,matchTier:text(row.match_tier),matchStatus:text(row.match_status),matchReason:text(signals.reason),variant,
+      price:number(row.current_bid_price)??number(row.price_value),currency:text(row.price_currency),bidCount:number(row.bid_count),endAt:end,live,
+      psa:{identity,population:coverage(row.population_status,identity==='processed'?(integer(row.has_population_rows)?'processed':'raw_missing'):'identity_missing'),
+        guide:coverage(row.guide_status,identity==='processed'?(integer(row.has_guide_rows)?'processed':'raw_missing'):'identity_missing'),
+        sales:coverage(row.sales_status,identity==='processed'?(integer(row.has_sales_rows)?'processed':'raw_missing'):'identity_missing')}};
+  });
+  const base=mapped;
+  const q=(search.get('q')??'').trim().toLowerCase(),tier=search.get('matchTier'),psa=search.get('psa'),scope=search.get('scope')??'all';
+  let filtered=base.filter((item)=>(!q||[item.title,item.itemId,item.variant?.name,item.variant?.setName].some((v)=>String(v??'').toLowerCase().includes(q)))
+    &&(!tier||item.matchTier===tier)&&(!psa||Object.values(item.psa).includes(psa as CoverageStatus))
+    &&(scope!=='live'||item.live));
+  filtered.sort((a,b)=>(b.live?1:0)-(a.live?1:0)||(a.endAt??'9999').localeCompare(b.endAt??'9999')||(b.listingId??0)-(a.listingId??0));
+  const {page,pageSize}=pageArgs(search),total=filtered.length,totalPages=Math.ceil(total/pageSize),safe=totalPages?Math.min(page,totalPages):1;
+  const campaigns=db.prepare(`SELECT campaign_id,query_text,marketplace,status,coverage_status,resume_after FROM ebay_campaigns
+    ORDER BY created_at DESC`).all() as unknown as Row[];
+  return{items:filtered.slice((safe-1)*pageSize,safe*pageSize),total,page:safe,pageSize,totalPages,
+    funnel:{searchMembers:base.length,detailsFetched:base.filter((x)=>x.acquisitionStatus==='fetched').length,
+      matched:base.filter((x)=>['exact','strong'].includes(x.matchTier??'')).length,
+      identityMissing:base.filter((x)=>['exact','strong'].includes(x.matchTier??'')&&x.psa.identity==='identity_missing').length,
+      population:base.filter((x)=>x.psa.population==='processed').length,guide:base.filter((x)=>x.psa.guide==='processed').length,
+      sales:base.filter((x)=>x.psa.sales==='processed').length},
+    campaigns:campaigns.map((row)=>({campaignId:String(row.campaign_id),query:String(row.query_text),marketplace:String(row.marketplace),
+      status:String(row.status),coverageStatus:String(row.coverage_status),resumeAfter:text(row.resume_after)}))};
+}
+
+export function listPipelines(db:DatabaseSync):PipelineListItem[]{
+  const queueRows=db.prepare(`SELECT source,queue,state,COUNT(*) n FROM work_items
+    WHERE (source='ebay' AND queue='ebay_item_detail' AND state IN ('pending','leased','running','retryable_failed','succeeded'))
+       OR (source='ebay' AND queue='ebay_search' AND state IN ('pending','leased','running'))
+       OR (source='psa' AND queue='psa_cert' AND state IN ('pending','leased','running','retryable_failed','succeeded'))
+    GROUP BY source,queue,state`).all() as unknown as Array<{source:string;queue:string;state:string;n:number}>;
+  const queueCount=(source:string,queue:string,state:string):number=>Number(queueRows.find((row)=>row.source===source&&row.queue===queue&&row.state===state)?.n??0);
+  const latestAttempt=(db.prepare(`SELECT MAX(a.finished_at) latest FROM attempts a JOIN work_items w ON w.work_item_id=a.work_item_id
+    WHERE w.source IN ('ebay','psa') AND w.queue IN ('ebay_item_detail','ebay_search','psa_cert')`).get() as {latest:string|null}).latest;
+  const progress={ebay:{searchPending:queueCount('ebay','ebay_search','pending'),detailPending:queueCount('ebay','ebay_item_detail','pending'),detailFetched:queueCount('ebay','ebay_item_detail','succeeded')},
+    psaCert:{pending:queueCount('psa','psa_cert','pending'),leased:queueCount('psa','psa_cert','leased')+queueCount('psa','psa_cert','running'),retryableFailed:queueCount('psa','psa_cert','retryable_failed'),succeeded:queueCount('psa','psa_cert','succeeded')},latestAttemptAt:latestAttempt};
+  return (db.prepare(`SELECT r.*,(SELECT source FROM pipeline_pauses p WHERE p.pipeline_run_id=r.pipeline_run_id AND p.resolved_at IS NULL ORDER BY created_at DESC LIMIT 1) pause_source,
+      (SELECT reason FROM pipeline_pauses p WHERE p.pipeline_run_id=r.pipeline_run_id AND p.resolved_at IS NULL ORDER BY created_at DESC LIMIT 1) pause_reason,
+      (SELECT resume_after FROM pipeline_pauses p WHERE p.pipeline_run_id=r.pipeline_run_id AND p.resolved_at IS NULL ORDER BY created_at DESC LIMIT 1) pause_resume
+    FROM pipeline_runs r ORDER BY r.created_at DESC LIMIT 50`).all() as unknown as Row[]).map((row)=>({
+      pipelineRunId:String(row.pipeline_run_id),status:row.pause_reason&&row.status!=='running'?'paused':String(row.status),activeStage:text(row.active_stage),
+      startedAt:String(row.started_at),endedAt:text(row.ended_at),pause:row.pause_reason?{source:String(row.pause_source),reason:String(row.pause_reason),resumeAfter:text(row.pause_resume)}:null,progress,
+    }));
+}
+
+export function getPipeline(db:DatabaseSync,id:string):Record<string,unknown>|null{
+  const run=db.prepare(`SELECT * FROM pipeline_runs WHERE pipeline_run_id=?`).get(id) as Row|undefined;if(!run)return null;
+  const stages=db.prepare(`SELECT stage_name,status,attempts,started_at,ended_at,summary_json,error_message FROM pipeline_stages
+    WHERE pipeline_run_id=? ORDER BY stage_order`).all(id) as unknown as Row[];
+  const campaigns=db.prepare(`SELECT c.*,(SELECT COUNT(*) FROM ebay_campaign_items i WHERE i.campaign_id=c.campaign_id) item_count
+    FROM ebay_campaigns c WHERE pipeline_run_id=?`).all(id);
+  const coverage=db.prepare(`SELECT c.phase,c.status,COUNT(*) n FROM pipeline_psa_coverage c JOIN pipeline_psa_targets t
+    ON t.pipeline_psa_target_id=c.pipeline_psa_target_id WHERE t.pipeline_run_id=? GROUP BY c.phase,c.status`).all(id);
+  const pause=db.prepare(`SELECT source,reason,resume_after,created_at FROM pipeline_pauses WHERE pipeline_run_id=? AND resolved_at IS NULL
+    ORDER BY created_at DESC LIMIT 1`).get(id);
+  return{run:{...run,status:pause&&run.status!=='running'?'paused':run.status},stages,campaigns,coverage,pause:pause??null};
 }
 export function getHealth(db:DatabaseSync):HealthData{const c=db.prepare(`SELECT (SELECT COUNT(*) FROM sets)sets,(SELECT COUNT(*) FROM cards)cards,(SELECT COUNT(*) FROM variants)variants,(SELECT COUNT(*) FROM psa_specs)specs,(SELECT COUNT(*) FROM psa_sales)sales`).get() as Row;const last=db.prepare(`SELECT MAX(executed_at)at FROM parser_executions WHERE parser_name='curated-materializer'`).get() as Row;const version=db.prepare(`PRAGMA user_version`).get() as Row;return{database:'ok',schemaVersion:integer(version.user_version),catalogue:{sets:integer(c.sets),cards:integer(c.cards),variants:integer(c.variants)},psa:{specs:integer(c.specs),sales:integer(c.sales)},lastMaterialization:text(last.at)}}

@@ -67,6 +67,8 @@ export interface PhaseStats {
   failed: number;
   /** Paths of the files this phase wrote, for a targeted follow-up import. */
   written: string[];
+  /** At least one request was rejected by PSA's upstream rate limit. */
+  rateLimited?: boolean;
 }
 
 export interface FetchOptions {
@@ -124,21 +126,23 @@ export function indexSalesCheckpoints(): void {
 
 interface SavedSalesCheckpoint {
   fetchedAt?: string;
-  cutoffIso?: string;
+  cutoffIso?: string | null;
   coverageComplete?: boolean;
+  coverageEvidence?: 'source_exhausted' | 'user_cutoff' | 'known_overlap' | 'page_cap_reached';
+  lastFullAuditAt?: string;
   sales?: RawApiSale[];
   totalCount?: number;
   pagesFetched?: number;
 }
 
-export function bestSalesCheckpoint(specId: number, preferredPath: string, cutoffIso: string): { path: string; saved: SavedSalesCheckpoint } | null {
+export function bestSalesCheckpoint(specId: number, preferredPath: string, cutoffIso: string | null): { path: string; saved: SavedSalesCheckpoint } | null {
   const candidates = [preferredPath, ...(salesCheckpointPaths.get(String(specId)) ?? []).filter((p) => p !== preferredPath)];
   let best: { path: string; saved: SavedSalesCheckpoint } | null = null;
   for (const candidate of candidates) {
     if (!fs.existsSync(candidate)) continue;
     try {
       const saved = JSON.parse(fs.readFileSync(candidate, 'utf8')) as SavedSalesCheckpoint;
-      if (saved.cutoffIso !== cutoffIso) continue;
+      if ((saved.cutoffIso ?? null) !== cutoffIso) continue;
       if (!best || Boolean(saved.coverageComplete) > Boolean(best.saved.coverageComplete)
         || (Boolean(saved.coverageComplete) === Boolean(best.saved.coverageComplete)
           && (saved.pagesFetched ?? 0) > (best.saved.pagesFetched ?? 0))) {
@@ -299,14 +303,32 @@ async function fetchPopulationOne(page: Page, entry: Selection, outDir: string):
   return outPath;
 }
 
-async function fetchSalesOne(page: Page, entry: Selection, outDir: string, cutoffIso: string): Promise<string> {
+function saleIdentity(sale:RawApiSale):string{
+  return sale.saleItemId || [sale.certNumber,sale.auctionHouse,sale.saleDate,sale.salePrice].join('|');
+}
+
+async function fetchSalesOne(page: Page, entry: Selection, outDir: string, options: {
+  cutoffIso: string | null; auditMaxAgeMs?: number; now?: number;
+}): Promise<string> {
   const outPath = path.join(outDir, `${entry.salesSpecId}.json`);
+  const cutoffIso=options.cutoffIso;
   let allSales: RawApiSale[] = [];
   let totalCount = 0;
   let pagesFetched = 0;
   let reachedCutoff = false;
+  let coverageEvidence:SavedSalesCheckpoint['coverageEvidence'];
+  let lastFullAuditAt:string|undefined;
 
   const checkpoint = bestSalesCheckpoint(entry.salesSpecId!, outPath, cutoffIso);
+  const now=options.now??Date.now();
+  const fullHistory=cutoffIso==null;
+  const lastAudit=checkpoint?.saved.lastFullAuditAt?Date.parse(checkpoint.saved.lastFullAuditAt):Number.NaN;
+  const auditDue=fullHistory&&(!checkpoint?.saved.coverageComplete||!Number.isFinite(lastAudit)
+    || now-lastAudit>=(options.auditMaxAgeMs??30*86_400_000));
+  const incremental=fullHistory&&Boolean(checkpoint?.saved.coverageComplete)&&!auditDue;
+  const knownSales=checkpoint?.saved.sales??[];
+  const knownIds=new Set(knownSales.map(saleIdentity));
+  let overlapPages=0;
   if (checkpoint && !checkpoint.saved.coverageComplete) {
     allSales = checkpoint.saved.sales ?? [];
     totalCount = checkpoint.saved.totalCount ?? 0;
@@ -320,24 +342,42 @@ async function fetchSalesOne(page: Page, entry: Selection, outDir: string, cutof
     pagesFetched++;
     if (sales.length === 0) {
       reachedCutoff = true;
+      coverageEvidence='source_exhausted';
       break;
     }
-    allSales.push(...sales);
-    const oldestIso = new Date(sales.at(-1)!.saleDate).toISOString().slice(0, 10);
-    if (oldestIso < cutoffIso) {
-      reachedCutoff = true;
+    if(incremental){
+      const allKnown=sales.every((sale)=>knownIds.has(saleIdentity(sale)));
+      overlapPages=allKnown?overlapPages+1:0;
+      allSales.push(...sales.filter((sale)=>!knownIds.has(saleIdentity(sale))));
+      if(overlapPages>=2){reachedCutoff=true;coverageEvidence='known_overlap';}
+    }else{
+      allSales.push(...sales);
     }
+    const oldestIso = new Date(sales.at(-1)!.saleDate).toISOString().slice(0, 10);
+    if (cutoffIso!=null&&oldestIso < cutoffIso) {
+      reachedCutoff = true;
+      coverageEvidence='user_cutoff';
+    }
+    const merged=incremental?[...allSales,...knownSales]:allSales;
+    const deduped=[...new Map(merged.map((sale)=>[saleIdentity(sale),sale])).values()];
     atomicWriteJson(outPath, {
       ...entry, fetchedAt: new Date().toISOString(), grade: '10', cutoffIso,
-      totalCount, pagesFetched, coverageComplete: reachedCutoff, sales: allSales,
+      totalCount, pagesFetched, coverageComplete: reachedCutoff,coverageEvidence,
+      lastFullAuditAt:!incremental&&fullHistory?new Date(now).toISOString():checkpoint?.saved.lastFullAuditAt,
+      sales:deduped,
     });
     if (reachedCutoff || shouldStop()) break;
     await page.waitForTimeout(SALES_REQUEST_DELAY_MS);
   }
 
+  if(!reachedCutoff&&pagesFetched>=SALES_MAX_PAGES)coverageEvidence='page_cap_reached';
+  const merged=incremental?[...allSales,...knownSales]:allSales;
+  allSales=[...new Map(merged.map((sale)=>[saleIdentity(sale),sale])).values()];
+  if(!incremental&&fullHistory)lastFullAuditAt=new Date(now).toISOString(); else lastFullAuditAt=checkpoint?.saved.lastFullAuditAt;
+
   atomicWriteJson(outPath, {
     ...entry, fetchedAt: new Date().toISOString(), grade: '10', cutoffIso,
-    totalCount, pagesFetched, coverageComplete: reachedCutoff, sales: allSales,
+    totalCount, pagesFetched, coverageComplete: reachedCutoff,coverageEvidence,lastFullAuditAt,sales:allSales,
   });
   const knownPaths = salesCheckpointPaths.get(String(entry.salesSpecId)) ?? [];
   if (!knownPaths.includes(outPath)) knownPaths.push(outPath);
@@ -366,6 +406,7 @@ export async function runPopulation(page: Page, release: string, entries: Select
       consecutiveFailures = 0;
     } catch (error) {
       stats.failed++;
+      if(/\b429\b|rate.?limit/i.test(error instanceof Error?error.message:String(error)))stats.rateLimited=true;
       consecutiveFailures++;
       console.error(`  FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -376,7 +417,9 @@ export async function runPopulation(page: Page, release: string, entries: Select
   return stats;
 }
 
-export async function runSales(page: Page, release: string, entries: Selection[], options: FetchOptions & { cutoffIso: string }): Promise<PhaseStats> {
+export async function runSales(page: Page, release: string, entries: Selection[], options: FetchOptions & {
+  cutoffIso: string | null; auditMaxAgeMs?: number;
+}): Promise<PhaseStats> {
   const stats: PhaseStats = { fetched: 0, skipped: 0, failed: 0, written: [] };
   const withSalesId = entries.filter((e): e is Selection & { salesSpecId: number; salesSourceUrl: string } => e.salesSpecId !== null);
   if (withSalesId.length === 0) {
@@ -409,11 +452,14 @@ export async function runSales(page: Page, release: string, entries: Selection[]
     }
     console.log(`[sales/${release}] ${entry.sourceCardId} ${entry.finish}/${entry.printRunMarker} (spec ${entry.salesSpecId})...`);
     try {
-      stats.written.push(await fetchSalesOne(page, entry, outDir, options.cutoffIso));
+      stats.written.push(await fetchSalesOne(page, entry, outDir, {
+        cutoffIso:options.cutoffIso,auditMaxAgeMs:options.auditMaxAgeMs,now:options.now,
+      }));
       stats.fetched++;
       consecutiveFailures = 0;
     } catch (error) {
       stats.failed++;
+      if(/\b429\b|rate.?limit/i.test(error instanceof Error?error.message:String(error)))stats.rateLimited=true;
       consecutiveFailures++;
       console.error(`  FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }

@@ -17,12 +17,17 @@ function seedBasepSet(db: ReturnType<typeof openDb>): { setId: number } {
   const set = db.prepare(
     `INSERT INTO sets (language, source_set_id, name, total_cards, created_at, updated_at) VALUES ('en', 'basep', 'Wizards Black Star Promos', 53, ?, ?) RETURNING set_id`,
   ).get(NOW, NOW) as { set_id: number };
+  const surfing = db.prepare(
+    `INSERT INTO cards (set_id, local_id, name, number, attributes_json, created_at, updated_at) VALUES (?, '28', 'Surfing Pikachu', '28', '{}', ?, ?) RETURNING card_id`,
+  ).get(set.set_id, NOW, NOW) as { card_id: number };
+  const stadium = db.prepare(
+    `INSERT INTO cards (set_id, local_id, name, number, attributes_json, created_at, updated_at) VALUES (?, '41', 'Lucky Stadium', '41', '{}', ?, ?) RETURNING card_id`,
+  ).get(set.set_id, NOW, NOW) as { card_id: number };
   db.prepare(
-    `INSERT INTO cards (set_id, local_id, name, number, attributes_json, created_at, updated_at) VALUES (?, '28', 'Surfing Pikachu', '28', '{}', ?, ?)`,
-  ).run(set.set_id, NOW, NOW);
-  db.prepare(
-    `INSERT INTO cards (set_id, local_id, name, number, attributes_json, created_at, updated_at) VALUES (?, '41', 'Lucky Stadium', '41', '{}', ?, ?)`,
-  ).run(set.set_id, NOW, NOW);
+    `INSERT INTO variants (card_id, variant_key, finish, size, display_label, attributes_json, created_at, updated_at)
+     VALUES (?, 'normal|||standard|', 'normal', 'standard', 'Normal', '{}', ?, ?),
+            (?, 'normal|||standard|', 'normal', 'standard', 'Normal', '{}', ?, ?)`,
+  ).run(surfing.card_id, NOW, NOW, stadium.card_id, NOW, NOW);
   return { setId: set.set_id };
 }
 

@@ -285,3 +285,50 @@ export interface AuctionDetail {
 }
 
 export interface ApiError { error: string; detail?: string }
+
+export type CoverageStatus = 'pending'|'identity_missing'|'raw_missing'|'raw_present'|'processed'|'no_data'|'rate_limited'|'failed';
+
+export interface EbayListingItem {
+  campaignId: string;
+  pipelineRunId: string;
+  query: string;
+  marketplace: string;
+  itemId: string;
+  listingId: number|null;
+  title: string|null;
+  acquisitionStatus: 'pending'|'fetched'|'rate_limited'|'failed';
+  matchTier: string|null;
+  matchStatus: string|null;
+  matchReason: string|null;
+  variant: VariantSearchItem|null;
+  price: number|null;
+  currency: string|null;
+  bidCount: number|null;
+  endAt: string|null;
+  live: boolean;
+  psa: { identity:CoverageStatus; population:CoverageStatus; guide:CoverageStatus; sales:CoverageStatus };
+}
+
+export interface EbayListingPageData extends Page<EbayListingItem> {
+  funnel: { searchMembers:number;detailsFetched:number;matched:number;identityMissing:number;population:number;guide:number;sales:number };
+  campaigns: Array<{campaignId:string;query:string;marketplace:string;status:string;coverageStatus:string;resumeAfter:string|null}>;
+}
+
+export interface PipelineListItem {
+  pipelineRunId:string;
+  status:string;
+  activeStage:string|null;
+  startedAt:string;
+  endedAt:string|null;
+  pause:{source:string;reason:string;resumeAfter:string|null}|null;
+  progress?:{ebay:{searchPending:number;detailPending:number;detailFetched:number};psaCert:{pending:number;leased:number;retryableFailed:number;succeeded:number};latestAttemptAt:string|null};
+}
+
+export interface PublicationStatus {
+  mode:'working'|'published';
+  generationId?:string;
+  pipelineRunId?:string;
+  createdAt?:string;
+  completeness:'partial'|'complete';
+  incompleteReason:string|null;
+}

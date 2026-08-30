@@ -14,6 +14,7 @@ export type EbayMarketplaceKey = 'de' | 'eu' | 'international';
 
 export interface EbayMarketplaceDef {
   marketplaceId: string;
+  currency: 'EUR' | 'USD';
   itemLocationCountries?: string[];
 }
 
@@ -21,14 +22,15 @@ export interface EbayMarketplaceDef {
 // "eu" = ebay.de site narrowed to a curated EU country list, "international"
 // = ebay.com (US) site, unfiltered (broadest global reach).
 export const EBAY_MARKETPLACES: Record<EbayMarketplaceKey, EbayMarketplaceDef> = {
-  de: { marketplaceId: 'EBAY_DE' },
+  de: { marketplaceId: 'EBAY_DE', currency: 'EUR' },
   eu: {
     marketplaceId: 'EBAY_DE',
+    currency: 'EUR',
     itemLocationCountries: [
       'DE', 'AT', 'FR', 'IT', 'ES', 'NL', 'BE', 'PL', 'SE', 'DK', 'IE', 'PT', 'CZ', 'FI', 'LU',
     ],
   },
-  international: { marketplaceId: 'EBAY_US' },
+  international: { marketplaceId: 'EBAY_US', currency: 'USD' },
 };
 
 export const DEFAULT_EBAY_QUERY = 'pikachu psa 10';

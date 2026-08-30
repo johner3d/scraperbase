@@ -24,6 +24,7 @@ export interface MaterializeOptions {
   includeEbay?: boolean;
   includeEcb?: boolean;
   now?: string;
+  pipelineRunId?: string;
 }
 
 export interface MaterializeResult {
@@ -555,7 +556,10 @@ function resolvePsaVariant(db:DatabaseSync,data:PsaIssue,sourceRecordId:number,a
   const cardId=findCard(db,data);
   if(!cardId){recordIssueReview(db,sourceRecordId,data,at,'No unique English card matched release and collector number');return{variantId:null,status:'unmatched'}}
   const parts:VariantParts={finish:data.finish,printRunMarker:data.printRunMarker,microVariant:data.microVariant,size:'standard'};
-  const variantId=upsertVariant(db,{cardId,parts,sourceRecordId,at,identity:'confirmed',attributes:{evidence:'psa-selection'}});
+  const variantId=resolveCanonicalPsaVariant(db,cardId,{
+    finish:valueText(parts.finish),printRunMarker:valueText(parts.printRunMarker),microVariant:valueText(parts.microVariant),
+  });
+  if(variantId==null){recordIssueReview(db,sourceRecordId,data,at,'PSA issue does not uniquely resolve to an existing canonical variant');return{variantId:null,status:'unmatched'}}
   linkSource(db,sourceRecordId,'variant',variantId,'matched','psa-explicit-selection',at);
   return{variantId,status:'matched'};
 }
@@ -644,7 +648,11 @@ async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omi
   const sales=latestFiles<SalesFile>(root,'sales',(data)=>String(data.salesSpecId));
   db.prepare(`DELETE FROM match_reviews WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa') AND status='open'`).run();
   db.prepare(`DELETE FROM source_links WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa')`).run();
-  db.prepare(`DELETE FROM psa_specs`).run();
+  // PSA identities are durable catalogue facts. A previous full DELETE made
+  // the eBay-derived target set drift between fetch and import whenever the
+  // native pop-report pass resolved additional specs. Upserts below refresh
+  // facts in place; materializePsaNative runs afterwards and remains the
+  // canonical final identity for specs present in PSA's own set reports.
   let psaSpecs=0,populationRows=0,priceRows=0,censusRows=0,salesRows=0,matchedPsaSpecs=0;
   const popPks=new Map<string,number>(),salesPks=new Map<string,number>();
   for(const [specId,data] of populations){
@@ -706,6 +714,26 @@ function writeNativePopulationCounts(db:DatabaseSync,specPk:number,row:PsaSetIte
   return rows;
 }
 
+/** PSA may identify an issue, but only TCGdex is allowed to create canonical variants. */
+function resolveCanonicalPsaVariant(db:DatabaseSync,cardId:number,parts:{finish:string;printRunMarker:string;microVariant:string}):number|null{
+  const rows=db.prepare(`SELECT v.variant_id,v.finish,v.print_run_marker,v.micro_variant
+    FROM variants v
+    LEFT JOIN source_records sr ON sr.source_record_id=v.source_record_id
+    WHERE v.card_id=? AND (v.source_record_id IS NULL OR sr.source='tcgdex')
+    ORDER BY v.variant_id`)
+    .all(cardId) as unknown as Array<{variant_id:number;finish:string|null;print_run_marker:string|null;micro_variant:string|null}>;
+  if(rows.length===0)return null;
+  if(rows.length===1)return rows[0]!.variant_id;
+  let pool=rows;
+  const narrow=(value:string,field:'finish'|'print_run_marker'|'micro_variant'):void=>{
+    const wanted=normalizePart(value);if(!wanted)return;
+    const next=pool.filter((row)=>normalizePart(row[field])===wanted);
+    if(next.length)pool=next;
+  };
+  narrow(parts.finish,'finish');narrow(parts.printRunMarker,'print_run_marker');narrow(parts.microVariant,'micro_variant');
+  return pool.length===1?pool[0]!.variant_id:null;
+}
+
 interface PsaSetItemsFile { headingId:string; name?:string; fetchedAt:string; data?:PsaSetItemRow[] }
 
 /**
@@ -749,13 +777,19 @@ async function materializePsaNative(db:DatabaseSync,at:string,dirs?:ObjectStoreD
       if(match.status==='skipped')continue;
       const sourceKey=String(row.SpecID);
       const recordId=upsertSourceRecord(db,{source:'psa',namespace:'population',sourceKey,entityType:'population',
-        language:heading.language,observation,observedAt:at});
+        language:match.language??heading.language,observation,observedAt:at});
       let variantId:number|null=null;
       if(match.status==='matched'&&match.cardId!=null&&match.variantParts){
-        variantId=upsertVariant(db,{cardId:match.cardId,parts:match.variantParts,sourceRecordId:recordId,at,identity:'inferred',
-          attributes:{evidence:'psa-pop-report',specId:row.SpecID}});
-        linkSource(db,recordId,'variant',variantId,'matched','psa-pop-report',at);
-        matchedPsaSpecs++;headingMatched++;
+        variantId=resolveCanonicalPsaVariant(db,match.cardId,match.variantParts);
+        if(variantId!=null){
+          linkSource(db,recordId,'variant',variantId,'matched','psa-pop-report',at);
+          matchedPsaSpecs++;headingMatched++;
+        }else{
+          linkSource(db,recordId,'card',match.cardId,'matched','psa-pop-report-card-only',at);
+          recordIssueReview(db,recordId,{sourceCardId:`${heading.source_set_id}-${row.CardNumber}`,finish:match.variantParts.finish,
+            printRunMarker:match.variantParts.printRunMarker,microVariant:match.variantParts.microVariant},at,
+            'PSA row matched a card but not one unique existing TCGdex variant');
+        }
       } else {
         recordIssueReview(db,recordId,{sourceCardId:`${heading.source_set_id}-${row.CardNumber}`,finish:'',printRunMarker:''},at,
           match.reason??'PSA pop-report row did not match a unique tcgdex card');
@@ -765,7 +799,7 @@ async function materializePsaNative(db:DatabaseSync,at:string,dirs?:ObjectStoreD
         finish:match.variantParts?.finish??'',printRunMarker:match.variantParts?.printRunMarker??'',
         microVariant:match.variantParts?.microVariant,psaSpecId:row.SpecID,
         popSourceUrl:`https://www.psacard.com/spec/psa/${row.SpecID}`,salesSpecId:row.SpecID,fetchedAt:at,populationRaw:'{}',
-      },recordId,variantId,match.status==='matched'?'matched':'unmatched');
+      },recordId,variantId,variantId!=null?'matched':'unmatched');
       populationRows+=writeNativePopulationCounts(db,specPk,row,at,observation.observation_id);
       psaSpecs++;
     }
@@ -900,9 +934,9 @@ function applyEbayOverride(db:DatabaseSync,sourceRecordId:number,result:EbayMatc
  * Inherited matches are always flagged -- they are an inference about a
  * different listing, not evidence from this one.
  */
-function propagateEbayClusters(db:DatabaseSync,at:string):number{
-  const rows=db.prepare(`SELECT ebay_listing_id,source_record_id,title,card_id,variant_id,match_tier,score FROM ebay_listings`).all() as unknown as
-    Array<{ebay_listing_id:number;source_record_id:number;title:string;card_id:number|null;variant_id:number|null;match_tier:string|null;score:number|null}>;
+function propagateEbayClusters(db:DatabaseSync,at:string,pipelineRunId?:string):number{
+  const rows=db.prepare(`SELECT ebay_listing_id,source_record_id,title,card_id,variant_id,match_tier,score,latest_observation_id,signals_json FROM ebay_listings`).all() as unknown as
+    Array<{ebay_listing_id:number;source_record_id:number;title:string;card_id:number|null;variant_id:number|null;match_tier:string|null;score:number|null;latest_observation_id:number|null;signals_json:string}>;
   const clusters=new Map<string,Array<typeof rows[number]>>();
   for(const row of rows){
     // Seller templates differ only by a trailing serial ("... #70ee") and by
@@ -926,6 +960,13 @@ function propagateEbayClusters(db:DatabaseSync,at:string):number{
       // record that was already resolved once cannot take a second resolved row.
       db.prepare(`DELETE FROM match_reviews WHERE source_record_id=? AND status='open'`).run(row.source_record_id);
       if(best.variant_id!=null) linkSource(db,row.source_record_id,'variant',best.variant_id,'matched','ebay-cluster-propagate',at,0.5);
+      const decisionHash=createHash('sha256').update(`cluster:${best.ebay_listing_id}:${best.card_id}:${best.variant_id}`).digest('hex');
+      db.prepare(`INSERT OR IGNORE INTO match_decision_revisions
+        (pipeline_run_id,source_record_id,observation_id,matcher_version,decision_hash,target_type,target_id,match_status,match_tier,
+         score,runner_up_score,reason,signals_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          pipelineRunId??null,row.source_record_id,row.latest_observation_id,'ebay-matcher-v2',decisionHash,
+          best.variant_id!=null?'variant':'card',best.variant_id??best.card_id,'matched','flagged',best.score,null,
+          `Inherited from title cluster member ${best.ebay_listing_id}`,row.signals_json||'{}',at);
       propagated++;
     }
   }
@@ -964,7 +1005,23 @@ async function buildCertVariantMap(db:DatabaseSync,dirs:ObjectStoreDirs):Promise
   return map;
 }
 
-async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs):Promise<{listings:number;matchedListings:number;priceObservations:number;propagated:number}>{
+function recordEbayDecisionRevision(db:DatabaseSync,args:{pipelineRunId?:string;sourceRecordId:number;observation:ObservationRow;result:EbayMatchResult;at:string}):void{
+  const decision=args.result.decision;
+  const signals=json(args.result.signals);
+  const hash=createHash('sha256').update(JSON.stringify({
+    cardId:decision.cardId,variantId:decision.variantId,tier:decision.tier,status:decision.matchStatus,
+    method:decision.method,score:decision.score,runnerUpScore:decision.runnerUpScore,reason:decision.reason,signals:args.result.signals,
+  })).digest('hex');
+  db.prepare(`INSERT OR IGNORE INTO match_decision_revisions
+    (pipeline_run_id,source_record_id,observation_id,matcher_version,decision_hash,target_type,target_id,
+     match_status,match_tier,score,runner_up_score,reason,signals_json,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      args.pipelineRunId??null,args.sourceRecordId,args.observation.observation_id,'ebay-matcher-v2',hash,
+      decision.variantId!=null?'variant':decision.cardId!=null?'card':null,decision.variantId??decision.cardId??null,
+      decision.matchStatus,decision.tier,decision.score,decision.runnerUpScore,decision.reason,signals,args.at);
+}
+
+async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs,pipelineRunId?:string):Promise<{listings:number;matchedListings:number;priceObservations:number;propagated:number}>{
   const rows=latestObservations(db,'item');
   // The queue is rebuilt from scratch on every run, exactly as the PSA path
   // does: a listing that a better matcher, a new alias or newly ingested cards
@@ -987,6 +1044,10 @@ async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs):P
     const cert=result.evidence.grading.certNumber?.trim();
     const certMatch=cert?certVariants.get(cert):undefined;
     if(certMatch){
+      const heuristic={cardId:result.decision.cardId,variantId:result.decision.variantId,tier:result.decision.tier,score:result.decision.score};
+      result.signals.certTruth={certNumber:cert,cardId:certMatch.cardId,variantId:certMatch.variantId,
+        heuristic,conflict:(heuristic.variantId!=null&&heuristic.variantId!==certMatch.variantId)
+          ||(heuristic.cardId!=null&&heuristic.cardId!==certMatch.cardId)};
       Object.assign(result.decision,{
         cardId:certMatch.cardId,variantId:certMatch.variantId,tier:'exact' as const,matchStatus:'matched' as const,
         method:'ebay-psa-cert',confidence:1,flagged:false,variantConfidence:'proven' as const,gapSubject:null,
@@ -1000,13 +1061,14 @@ async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs):P
       sourceRecordId:record,marketplace,itemId,legacyItemId:nullableText(item.legacyItemId),itemWebUrl:nullableText(item.itemWebUrl),
       title:valueText(item.title,itemId),grading:result.evidence.grading,result,item,at,observation:row,
     });
+    recordEbayDecisionRevision(db,{pipelineRunId,sourceRecordId:record,observation:row,result,at});
     if(isReviewable(result)) recordEbayReview(db,record,at,result);
     listings++;
     if(result.decision.cardId!=null) matchedListings++;
     if(insertEbayPriceObservation(db,listingId,item,row,at)) priceObservations++;
     recordParser(db,row,at,{kind:'ebay-item',listingId,matchStatus:result.decision.matchStatus,tier:result.decision.tier});
   }
-  const propagated=propagateEbayClusters(db,at);
+  const propagated=propagateEbayClusters(db,at,pipelineRunId);
   return{listings,matchedListings:matchedListings+propagated,priceObservations,propagated};
 }
 
@@ -1037,7 +1099,7 @@ export async function materialize(db:DatabaseSync,options:MaterializeOptions={})
       const native=await materializePsaNative(db,at,options.objectStoreDirs);
       result.psaSpecs+=native.psaSpecs;result.populationRows+=native.populationRows;result.matchedPsaSpecs+=native.matchedPsaSpecs;
     }
-    if(options.includeEbay!==false){const ebay=await materializeEbay(db,at,options.ebayDirs??EBAY_RAW_DIRS);result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;}
+    if(options.includeEbay!==false){const ebay=await materializeEbay(db,at,options.ebayDirs??EBAY_RAW_DIRS,options.pipelineRunId);result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;}
     if(options.includeEcb!==false)result.exchangeRates=await materializeEcb(db,at,options.objectStoreDirs);
     result.openReviews=Number((db.prepare(`SELECT COUNT(*) n FROM match_reviews WHERE status='open'`).get() as {n:number}).n);
     db.exec('COMMIT');return result;

@@ -46,10 +46,11 @@ interface SalesFile {
   salesSourceUrl: string;
   fetchedAt: string;
   grade: string;
-  cutoffIso: string;
+  cutoffIso: string | null;
   totalCount: number;
   pagesFetched: number;
   coverageComplete: boolean;
+  coverageEvidence?: string;
 }
 
 function entityKey(e: { sourceCardId: string; finish: string; printRunMarker: string; microVariant?: string }): string {
@@ -212,7 +213,7 @@ export async function importSalesFile(db: DatabaseSync, filePath: string, runId:
       scopeKey,
       data.coverageComplete ? 'complete' : 'cutoff',
       data.pagesFetched,
-      data.coverageComplete ? 'user_cutoff' : 'page_cap_reached',
+      data.coverageEvidence ?? (data.coverageComplete ? (data.cutoffIso==null?'source_exhausted':'user_cutoff') : 'page_cap_reached'),
       data.fetchedAt,
     );
 

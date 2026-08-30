@@ -11,6 +11,7 @@ import {
   type EbayMarketplaceKey,
 } from '../config.ts';
 import { itemScopeKey, liveAuctionAsOfTag, searchPageScopeKey, type EbaySearchMode } from '../scopeKeys.ts';
+import { ebayQuotaState, nextEbayReset } from '../quota.ts';
 
 export interface SearchParams {
   marketplace: EbayMarketplaceKey;
@@ -31,6 +32,11 @@ export interface SearchParams {
   mode?: EbaySearchMode;
   minBidCount?: number;
   endingBeforeAt?: string;
+  /** Professional-pipeline provenance. It never participates in matching. */
+  campaignId?: string;
+  priceMin?: number;
+  priceMax?: number;
+  refreshDetails?: boolean | number;
 }
 
 export interface SearchDeps {
@@ -109,6 +115,10 @@ export function buildSearchUrl(params: SearchParams): string {
   const liveAuctions = params.mode === 'live_auctions';
   const filters = [`buyingOptions:{${liveAuctions ? 'AUCTION' : EBAY_ALL_BUYING_OPTIONS.join('|')}}`];
   if (def.itemLocationCountries?.length) filters.push(`itemLocationCountry:{${def.itemLocationCountries.join('|')}}`);
+  if (params.priceMin != null || params.priceMax != null) {
+    filters.push(`price:[${(params.priceMin ?? 0).toFixed(2)}..${params.priceMax == null ? '' : params.priceMax.toFixed(2)}]`);
+    filters.push(`priceCurrency:${def.currency}`);
+  }
   qs.set('filter', filters.join(','));
   if (liveAuctions) qs.set('sort', 'endingSoonest');
   return `${EBAY_SEARCH_URL}?${qs.toString()}`;
@@ -126,6 +136,15 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
     const url = buildSearchUrl(params);
     const sourceIdentity = `ebay:${params.marketplace}`;
 
+    const quota = ebayQuotaState(db);
+    if (quota.paused) {
+      if (params.campaignId) db.prepare(`UPDATE ebay_campaigns SET status='incomplete',coverage_status='quota_paused',
+        resume_after=?,pause_reason=? WHERE campaign_id=?`).run(quota.resumeAfter,
+          `Daily safety budget reached (${quota.used}/${quota.limit}; allowance ${quota.allowance})`,params.campaignId);
+      return {outcome:'rate_limited',final:'partial',sourceIdentity,retryAfterMs:Math.max(0,Date.parse(quota.resumeAfter)-Date.now()),
+        errorMessage:`eBay daily safety budget reached; resume after ${quota.resumeAfter}`};
+    }
+
     await deps.rateLimiter();
     const token = await getEbayAccessToken();
     const res = await fetchRaw(url, {
@@ -135,9 +154,15 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
     const httpClass = classifyHttpStatus(res.status);
 
     if (httpClass !== 'success') {
+      if (params.campaignId) {
+        const coverage = res.status === 429 ? 'quota_paused' : 'failed';
+        db.prepare(`UPDATE ebay_campaigns SET status=?,coverage_status=?,resume_after=?,pause_reason=? WHERE campaign_id=?`)
+          .run(res.status === 429 ? 'incomplete' : 'failed', coverage,
+            res.status===429?nextEbayReset().toISOString():null,res.status===429?'eBay returned HTTP 429':null,params.campaignId);
+      }
       return {
-        outcome: 'failure',
-        final: httpClass === 'permanent' ? 'permanent_failed' : 'retryable_failed',
+        outcome: res.status === 429 ? 'rate_limited' : 'failure',
+        final: res.status === 429 ? 'partial' : httpClass === 'permanent' ? 'permanent_failed' : 'retryable_failed',
         sourceIdentity,
         httpStatus: res.status,
         requestMethod: 'GET',
@@ -195,11 +220,21 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
       : { itemIds: (parsed.itemSummaries ?? []).map((s) => s.itemId).filter((id): id is string => typeof id === 'string' && id.length > 0), pastCutoff: false };
     const pastCutoff = selection.pastCutoff;
 
+    if (params.campaignId) {
+      const now = new Date().toISOString();
+      db.prepare(`UPDATE ebay_campaigns SET status='running',total_reported=MAX(COALESCE(total_reported,0),COALESCE(?,0)) WHERE campaign_id=?`)
+        .run(parsed.total ?? null, params.campaignId);
+      const membership = db.prepare(`INSERT INTO ebay_campaign_items
+        (campaign_id,marketplace,item_id,first_seen_at,last_seen_at) VALUES(?,?,?,?,?)
+        ON CONFLICT(campaign_id,marketplace,item_id) DO UPDATE SET last_seen_at=excluded.last_seen_at`);
+      for (const itemId of selection.itemIds) membership.run(params.campaignId, params.marketplace, itemId, now, now);
+    }
+
     // A live sweep is a snapshot refresh, not discovery-only. Re-arm detail
     // work that succeeded in an older sweep so bids/end state can change and
     // produce another append-only price observation. New IDs are still
     // inserted normally by enqueueNext below.
-    if (liveAuctions) {
+    if (liveAuctions || (params.campaignId && params.refreshDetails!==false && params.refreshDetails!==0)) {
       const now = new Date().toISOString();
       const reset = db.prepare(`UPDATE work_items SET state='pending',attempts=0,available_at=?,last_error=NULL,
         lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE work_item_id=? AND state='succeeded'`);
@@ -216,8 +251,9 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
 
     const apiNextOffset = nextOffset(parsed);
     const total = parsed.total ?? 0;
+    const apiWindowIncomplete = params.maxItems === 0 && total > 10_000 && params.offset === 0;
     const underConfiguredCap = params.maxItems === 0 || (apiNextOffset !== undefined && apiNextOffset < params.maxItems);
-    if (apiNextOffset !== undefined && underConfiguredCap && !pastCutoff) {
+    if (apiNextOffset !== undefined && underConfiguredCap && !pastCutoff && !apiWindowIncomplete) {
       enqueueNext.push({
         source: 'ebay',
         queue: 'ebay_search',
@@ -225,13 +261,25 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
         scopeKey: searchPageScopeKey(
           params.marketplace, params.query, apiNextOffset, params.limit, params.maxItems, params.mode,
           params.endingBeforeAt ? liveAuctionAsOfTag(params.endingBeforeAt) : undefined,
+          params.priceMin, params.priceMax,
         ),
         params: { ...params, offset: apiNextOffset },
       });
     }
 
-    const apiWindowIncomplete = params.maxItems === 0 && total > 10_000 && params.offset === 0;
     if (apiWindowIncomplete) {
+      if (params.campaignId && params.mode !== 'live_auctions') {
+        for (const partition of splitPricePartition(params)) {
+          enqueueNext.push({
+            source: 'ebay', queue: 'ebay_search', entityType: 'search_page',
+            scopeKey: searchPageScopeKey(params.marketplace,params.query,0,params.limit,params.maxItems,params.mode,
+              undefined,partition.priceMin,partition.priceMax),
+            params: { ...params, offset: 0, ...partition },
+          });
+        }
+        db.prepare(`UPDATE ebay_campaigns SET status='running',coverage_status='unknown' WHERE campaign_id=?`).run(params.campaignId);
+        return { ...base, final: 'succeeded', enqueueNext } satisfies CollectorOutcome;
+      }
       return {
         ...base,
         outcome: 'schema_drift',
@@ -241,6 +289,28 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
       } satisfies CollectorOutcome;
     }
 
+    if (params.campaignId && (apiNextOffset === undefined || !underConfiguredCap || pastCutoff)) {
+      db.prepare(`UPDATE ebay_campaigns SET status='complete',coverage_status='complete',completed_at=? WHERE campaign_id=?`)
+        .run(new Date().toISOString(), params.campaignId);
+    }
+
     return { ...base, final: 'succeeded', enqueueNext } satisfies CollectorOutcome;
   };
+}
+
+/** Deterministic recursive price partitioning for eBay's 10,000-result window. */
+export function splitPricePartition(params: Pick<SearchParams,'priceMin'|'priceMax'>): Array<{priceMin:number;priceMax?:number}> {
+  const min = params.priceMin ?? 0;
+  const max = params.priceMax;
+  if (max == null && min === 0) {
+    const boundaries = [25,50,100,250,500,1000,2500,5000];
+    const result: Array<{priceMin:number;priceMax?:number}> = [];
+    let start = 0;
+    for (const end of boundaries) { result.push({ priceMin: start, priceMax: end }); start = end + 0.01; }
+    result.push({ priceMin: start });
+    return result;
+  }
+  const split = max == null ? Math.max(min * 2, min + 5000) : Number(((min + max) / 2).toFixed(2));
+  if (max != null && split <= min) throw new Error(`Cannot further partition price interval ${min}..${max}`);
+  return [{ priceMin: min, priceMax: split }, { priceMin: split + 0.01, ...(max == null ? {} : { priceMax: max }) }];
 }

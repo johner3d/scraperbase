@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer as createViteServer, type ViteDevServer } from 'vite';
 import { DB_PATH, MEDIA_CACHE_DIR, OBJECTS_DIR } from '../core/config/config.ts';
-import { getAuction, getAuctionFacets, getCard, getFacets, getHealth, getMarket, getPopulation, getVariant, listAuctions, listCards, listMatchReviews, listSources, listVariants } from './api.ts';
+import { resolvePublishedDatabase, resolvePublishedManifest } from '../pipeline/publication.ts';
+import { getAuction, getAuctionFacets, getCard, getFacets, getHealth, getMarket, getPopulation, getVariant, listAuctions, listCards, listMatchReviews, listSources, listVariants, listEbayListings, listPipelines, getPipeline } from './api.ts';
 import { safeStoredPath } from './mediaPath.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -31,21 +32,59 @@ function idFromPath(pathname: string, prefix: string): number | null {
   return /^\d+$/.test(value) ? Number(value) : null;
 }
 
-function openReadOnly(): DatabaseSync {
-  if (!existsSync(DB_PATH)) throw new Error(`Database does not exist at ${DB_PATH}`);
-  const db = new DatabaseSync(DB_PATH, { readOnly: true });
+function openReadOnly(dbPath = resolvePublishedDatabase()): DatabaseSync {
+  if (!existsSync(dbPath)) throw new Error(`Database does not exist at ${dbPath}`);
+  const db = new DatabaseSync(dbPath, { readOnly: true });
   db.exec('PRAGMA query_only = ON');
   db.exec('PRAGMA foreign_keys = ON');
   return db;
 }
 
-async function apiHandler(db: DatabaseSync, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+/** Hot-swaps only after publication's pointer changes; in-flight synchronous queries finish on the old handle. */
+class PublishedDb {
+  private path = resolvePublishedDatabase();
+  private connection = openReadOnly(this.path);
+
+  get(): DatabaseSync {
+    const next = resolvePublishedDatabase();
+    if (next !== this.path) {
+      const replacement = openReadOnly(next);
+      const previous = this.connection;
+      this.connection = replacement;
+      this.path = next;
+      previous.close();
+      console.log(`Published data generation switched to ${next}`);
+    }
+    return this.connection;
+  }
+
+  close(): void { this.connection.close(); }
+}
+
+export function isOperationalApiPath(pathname:string):boolean {
+  return pathname==='/api/pipelines'||pathname.startsWith('/api/pipelines/')||pathname==='/api/sources'
+    ||pathname==='/api/reviews'||pathname==='/api/ebay-listings';
+}
+
+async function apiHandler(publishedDb: DatabaseSync, operationalDb:DatabaseSync, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   if (req.method !== 'GET' || !url.pathname.startsWith('/api/')) return false;
   try {
+    if(url.pathname==='/api/publication'){
+      const manifest=resolvePublishedManifest();
+      json(res,200,manifest?{mode:'published',...manifest}:{mode:'working',completeness:'partial',incompleteReason:'No published generation exists yet'});
+      return true;
+    }
+    const pipelineActive=Boolean(operationalDb.prepare("SELECT 1 FROM pipeline_runs WHERE status='running' LIMIT 1").get());
+    // During an active run, serve committed working data so each completed
+    // downstream batch is visible immediately. Once the run is idle, return to
+    // the validated immutable generation for stable reads.
+    const db=pipelineActive||isOperationalApiPath(url.pathname)?operationalDb:publishedDb;
     if (url.pathname === '/api/cards') { json(res, 200, listCards(db, url.searchParams)); return true; }
     if (url.pathname === '/api/variants') { json(res, 200, listVariants(db, url.searchParams)); return true; }
     if (url.pathname === '/api/auctions') { json(res, 200, listAuctions(db, url.searchParams)); return true; }
+    if (url.pathname === '/api/ebay-listings') { json(res, 200, listEbayListings(db, url.searchParams)); return true; }
+    if (url.pathname === '/api/pipelines') { json(res, 200, {items:listPipelines(db)}); return true; }
     if (url.pathname === '/api/auction-facets') { json(res, 200, getAuctionFacets(db)); return true; }
     if (url.pathname === '/api/sources') { json(res, 200, { items: listSources(db) }); return true; }
     if (url.pathname === '/api/facets') { json(res, 200, getFacets(db)); return true; }
@@ -63,6 +102,8 @@ async function apiHandler(db: DatabaseSync, req: IncomingMessage, res: ServerRes
     }
     const variantId = idFromPath(url.pathname, '/api/variants/');
     if (variantId != null) { const result = getVariant(db, variantId); json(res, result ? 200 : 404, result ?? { error: 'Variant not found' }); return true; }
+    const pipelineId=url.pathname.match(/^\/api\/pipelines\/([a-f0-9-]+)$/i)?.[1];
+    if(pipelineId){const result=getPipeline(db,pipelineId);json(res,result?200:404,result??{error:'Pipeline not found'});return true;}
     json(res, 404, { error: 'API route not found' }); return true;
   } catch (error) {
     console.error(error);
@@ -153,18 +194,20 @@ function lanAddress(): string {
 }
 
 async function main(): Promise<void> {
-  const db = openReadOnly();
+  const published = new PublishedDb();
+  const operational = openReadOnly(DB_PATH);
   let vite: ViteDevServer | undefined;
   if (DEV) vite = await createViteServer({ root: path.join(ROOT, 'web'), server: { middlewareMode: true }, appType: 'spa' });
   const handler: AnyHandler = async (req, res) => {
-    if (await apiHandler(db, req, res)) return;
+    const db = published.get();
+    if (await apiHandler(db, operational, req, res)) return;
     if (await mediaHandler(db, req, res)) return;
     if (vite) return new Promise<void>((resolve) => vite!.middlewares(req, res, () => resolve()));
     return staticHandler(req, res);
   };
   const server = createServer((req, res) => { void handler(req, res); });
   server.listen(PORT, '0.0.0.0', () => { console.log(`Local: http://localhost:${PORT}`); console.log(`LAN:   http://${lanAddress()}:${PORT}`); });
-  const close = () => { vite?.close(); db.close(); server.close(); };
+  const close = () => { vite?.close(); operational.close(); published.close(); server.close(); };
   process.on('SIGINT', close); process.on('SIGTERM', close);
 }
 

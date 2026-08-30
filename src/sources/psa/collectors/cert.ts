@@ -7,6 +7,8 @@ import type { RateLimiter } from '../../../core/http/rateLimiter.ts';
 import { PSA_BASE } from '../config.ts';
 import { certScopeKey } from '../scopeKeys.ts';
 
+const CERT_EVALUATE_TIMEOUT_MS=30_000;
+
 /**
  * Resolves a PSA certification number to the graded card's spec.
  *
@@ -30,6 +32,9 @@ export interface CertDeps {
    * check; the request has to run in-page to carry its cookies.
    */
   page: Page;
+  /** Optional lifecycle hook used by long-running queues. It may recreate a
+   * page when the visible browser was closed or Chromium crashed. */
+  getPage?: () => Promise<Page>;
   rateLimiter: RateLimiter;
 }
 
@@ -71,11 +76,15 @@ export function createPsaCertCollector(deps: CertDeps): Collector {
     const sourceIdentity = `psa:cert:${certNumber}`;
 
     await deps.rateLimiter();
+    const page=deps.getPage?await deps.getPage():deps.page;
     const start = Date.now();
-    const result = await deps.page.evaluate(async (url: string) => {
-      const res = await fetch(url, { headers: { Accept: 'text/html' } });
-      return { status: res.status, body: await res.text() };
-    }, requestUrl);
+    const result = await new Promise<{status:number;body:string}>((resolve,reject)=>{
+      const timer=setTimeout(()=>reject(new Error(`PSA cert request timed out after ${CERT_EVALUATE_TIMEOUT_MS}ms`)),CERT_EVALUATE_TIMEOUT_MS);
+      page.evaluate(async (url: string) => {
+        const res = await fetch(url, { headers: { Accept: 'text/html' } });
+        return { status: res.status, body: await res.text() };
+      }, requestUrl).then((value)=>{clearTimeout(timer);resolve(value);},(error)=>{clearTimeout(timer);reject(error);});
+    });
     const durationMs = Date.now() - start;
     const body = Buffer.from(result.body, 'utf8');
     const httpClass = classifyHttpStatus(result.status);

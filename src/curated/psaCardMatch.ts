@@ -21,9 +21,18 @@ export interface CardMatchResult {
   cardId: number | null;
   variantParts: { finish: string; printRunMarker: string; microVariant: string } | null;
   reason?: string;
+  language?: string;
 }
 
 const NON_ENGLISH_VARIETY = /-(french|german|italian|spanish|japanese|korean|portuguese|chinese)\b/i;
+const VARIETY_LANGUAGES:Record<string,string>={english:'en',german:'de',japanese:'ja',french:'fr',italian:'it',spanish:'es',korean:'ko',portuguese:'pt',chinese:'zh'};
+
+function rowLanguage(defaultLanguage:string,row:PsaSetItemRow):string|null{
+  const text=normalizePart(row.Variety??'');
+  const found=Object.entries(VARIETY_LANGUAGES).find(([name])=>new RegExp(`(^|_)${name}($|_)`).test(text));
+  const language=found?.[1]??defaultLanguage;
+  return ['en','de','ja'].includes(language)?language:null;
+}
 
 /**
  * A single PSA heading can mix English rows with foreign-language rows
@@ -78,20 +87,21 @@ interface CardRow {
  * name as corroboration. Never guesses across an ambiguous number match.
  */
 export function matchPsaCardRow(db: DatabaseSync, sourceSetId: string, language: string, row: PsaSetItemRow): CardMatchResult {
-  if (!isEnglishRow(row)) return { status: 'skipped', cardId: null, variantParts: null, reason: 'non-English Variety, cross-set resolution not yet supported' };
+  const targetLanguage=rowLanguage(language,row);
+  if (!targetLanguage) return { status: 'skipped', cardId: null, variantParts: null, reason: 'Variety language is outside the en/de/ja catalogue' };
 
   const number = normalizeCardNumber(row.CardNumber);
   if (!number) return { status: 'unmatched', cardId: null, variantParts: null, reason: 'PSA row has no CardNumber' };
 
   const setCards = db.prepare(
     `SELECT c.card_id, c.local_id, c.name FROM cards c JOIN sets s ON s.set_id = c.set_id WHERE s.language = ? AND s.source_set_id = ?`,
-  ).all(language, sourceSetId) as unknown as CardRow[];
+  ).all(targetLanguage, sourceSetId) as unknown as CardRow[];
   const pool = setCards.filter((c) => normalizeCardNumber(c.local_id) === number);
 
   if (pool.length === 0) return { status: 'unmatched', cardId: null, variantParts: null, reason: `no card numbered ${number} in ${sourceSetId}` };
 
   if (pool.length === 1) {
-    return { status: 'matched', cardId: pool[0]!.card_id, variantParts: inferVariantSignals(row.SubjectName, row.Variety) };
+    return { status: 'matched', cardId: pool[0]!.card_id, variantParts: inferVariantSignals(row.SubjectName, row.Variety),language:targetLanguage };
   }
 
   // Multiple cards share this number (rare, but tcgdex does this for some
@@ -105,7 +115,7 @@ export function matchPsaCardRow(db: DatabaseSync, sourceSetId: string, language:
   }).sort((a, b) => b.overlap - a.overlap);
 
   if (scored[0]!.overlap > 0 && (scored.length === 1 || scored[0]!.overlap > scored[1]!.overlap)) {
-    return { status: 'matched', cardId: scored[0]!.card.card_id, variantParts: inferVariantSignals(row.SubjectName, row.Variety) };
+    return { status: 'matched', cardId: scored[0]!.card.card_id, variantParts: inferVariantSignals(row.SubjectName, row.Variety),language:targetLanguage };
   }
   return { status: 'ambiguous', cardId: null, variantParts: null, reason: `${pool.length} cards numbered ${number} in ${sourceSetId}, name corroboration inconclusive` };
 }

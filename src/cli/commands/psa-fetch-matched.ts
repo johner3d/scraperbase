@@ -36,7 +36,8 @@ interface Options {
   force: boolean;
   maxAgeMs: number | null;
   only: 'population' | 'sales' | 'both';
-  since: string;
+  since: string | null;
+  salesAuditDays: number;
   tiers: string[] | undefined;
   excludeFlagged: boolean;
   liveAuctions: boolean;
@@ -54,6 +55,8 @@ function parseOptions(args: string[]): Options {
       'max-age': { type: 'string', default: '7' },
       only: { type: 'string', default: 'both' },
       since: { type: 'string' },
+      'all-sales': { type: 'boolean', default: false },
+      'sales-audit-days': { type: 'string', default: '30' },
       tiers: { type: 'string' },
       'exclude-flagged': { type: 'boolean', default: false },
       'live-auctions': { type: 'boolean', default: false },
@@ -78,8 +81,10 @@ function parseOptions(args: string[]): Options {
 
   const cutoff = new Date();
   cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 2);
-  const since = values.since != null ? String(values.since) : cutoff.toISOString().slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) throw new Error(`Invalid --since date: ${since}`);
+  const since = values['all-sales'] ? null : values.since != null ? String(values.since) : cutoff.toISOString().slice(0, 10);
+  if (since!=null&&!/^\d{4}-\d{2}-\d{2}$/.test(since)) throw new Error(`Invalid --since date: ${since}`);
+  const salesAuditDays=Number(values['sales-audit-days']);
+  if(!Number.isFinite(salesAuditDays)||salesAuditDays<=0)throw new Error('--sales-audit-days must be positive');
 
   const tiers = values.tiers != null ? String(values.tiers).split(',').map((t) => t.trim()).filter(Boolean) : undefined;
 
@@ -91,6 +96,7 @@ function parseOptions(args: string[]): Options {
     maxAgeMs: maxAgeDays === 0 ? null : maxAgeDays * DAY_MS,
     only,
     since,
+    salesAuditDays,
     tiers,
     excludeFlagged: Boolean(values['exclude-flagged']),
     liveAuctions: Boolean(values['live-auctions']),
@@ -214,7 +220,9 @@ export async function psaFetchMatchedCommand(args: string[]): Promise<void> {
         batch++;
         console.log(`\n=== [${batch}/${groups.size}] ${release}: ${entries.length} spec(s) ===`);
         if (options.only !== 'sales') add(pop, await runPopulation(page, release, entries, fetchOptions));
-        if (options.only !== 'population') add(sales, await runSales(page, release, entries, { ...fetchOptions, cutoffIso: options.since }));
+        if (options.only !== 'population') add(sales, await runSales(page, release, entries, {
+          ...fetchOptions, cutoffIso: options.since, auditMaxAgeMs:options.salesAuditDays*DAY_MS,
+        }));
       }
     } finally {
       await context.close();
@@ -229,6 +237,7 @@ export async function psaFetchMatchedCommand(args: string[]): Promise<void> {
       materialized = await materialize(db, { includeTcgdex: false, includeEbay: false, includeEcb: false });
     }
 
+    if(pop.failed>0||sales.failed>0)throw new Error(`PSA fetch incomplete: population failures=${pop.failed}, sales failures=${sales.failed}`);
     finishRun(db, runId, shouldStop() ? 'cancelled' : 'completed');
 
     const elapsedSec = Math.round((Date.now() - startedAt) / 1000);

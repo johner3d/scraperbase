@@ -43,6 +43,7 @@ import { createPsaCertCollector, seedPsaCertLookups } from '../../sources/psa/co
 import { seedEcbRates } from '../../sources/ecb/discovery.ts';
 import { createEcbRatesCollector } from '../../sources/ecb/collector.ts';
 import { ECB_RATES_QUEUE } from '../../sources/ecb/config.ts';
+import { materialize } from '../../curated/materialize.ts';
 
 export type AcquisitionStage = 'index' | 'details' | 'images' | 'cert' | 'all';
 export type DetailPriority = 'psa' | 'all';
@@ -97,6 +98,9 @@ export async function runCommand(args: string[]): Promise<void> {
       'live-auctions': { type: 'boolean', default: false },
       'min-bids': { type: 'string', default: String(DEFAULT_EBAY_MIN_BID_COUNT) },
       'ending-within-hours': { type: 'string', default: String(DEFAULT_EBAY_ENDING_WITHIN_HOURS) },
+      // Internal provenance id used by `pipeline run`; harmless for expert commands.
+      'campaign-id': { type: 'string' },
+      'campaign-search-only': { type: 'boolean', default: false },
     },
   });
 
@@ -216,6 +220,7 @@ export async function runCommand(args: string[]): Promise<void> {
       if (marketplaces.length === 0) throw new Error('--marketplaces must contain at least one marketplace');
       if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('--limit must be an integer from 1 to 200');
       const rateLimiter = createRateLimiter({ minDelayMs: 250, jitterMs: 150 });
+      const ebayRateLimitSafety = { haltOnRateLimit: true, cooldown: { afterConsecutiveFailures: 3, cooldownMs: 60_000 } };
 
       if (values['live-auctions']) {
         const query = (values.query as string | undefined) ?? DEFAULT_EBAY_LIVE_AUCTION_QUERY;
@@ -233,11 +238,12 @@ export async function runCommand(args: string[]): Promise<void> {
           });
           await runQueue(db, {
             queue: 'ebay_search', collector: createEbaySearchCollector({ rateLimiter }),
-            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+            scopeContains: `search:${marketplace}:${query}:`,
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, ...ebayRateLimitSafety,
           });
           await runQueue(db, {
             queue: 'ebay_item_detail', collector: createEbayItemDetailCollector({ rateLimiter }),
-            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, ...ebayRateLimitSafety,
           });
         }
       } else {
@@ -250,14 +256,16 @@ export async function runCommand(args: string[]): Promise<void> {
         }
 
         for (const marketplace of marketplaces) {
-          seedEbaySearch(db, { marketplace, query, limit, maxItems });
+          seedEbaySearch(db, { marketplace, query, limit, maxItems, campaignId: values['campaign-id'] as string | undefined,
+            refreshDetails:!values['campaign-search-only'] });
           await runQueue(db, {
             queue: 'ebay_search', collector: createEbaySearchCollector({ rateLimiter }),
-            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+            scopeContains: `search:${marketplace}:${query}:`,
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, ...ebayRateLimitSafety,
           });
           await runQueue(db, {
             queue: 'ebay_item_detail', collector: createEbayItemDetailCollector({ rateLimiter }),
-            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, ...ebayRateLimitSafety,
           });
         }
       }
@@ -280,8 +288,17 @@ export async function runCommand(args: string[]): Promise<void> {
       // of how many in a row had just failed).
       const rateLimiter = createRateLimiter({ minDelayMs: 600, jitterMs: 300 });
       const cooldown = { afterConsecutiveFailures: 3, cooldownMs: 60_000 };
-      const context = await launchPsaProfile({ headless: false });
-      const page = await context.newPage();
+      let context = await launchPsaProfile({ headless: false });
+      let page = await context.newPage();
+      const ensurePage = async () => {
+        if (!page.isClosed() && (context.browser()?.isConnected() ?? false)) return page;
+        console.warn('PSA browser page/context closed; relaunching the persistent profile before retrying...');
+        await context.close().catch(() => {});
+        context = await launchPsaProfile({ headless: false });
+        page = await context.newPage();
+        await page.goto('https://www.psacard.com/pop/tcg-cards/156940', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+        return page;
+      };
       try {
         await page.goto('https://www.psacard.com/pop/tcg-cards/156940', { waitUntil: 'domcontentloaded', timeout: 60_000 });
         if (opts.stage === 'index' || opts.stage === 'all') {
@@ -306,9 +323,18 @@ export async function runCommand(args: string[]): Promise<void> {
         if (opts.stage === 'cert') {
           const seeded = seedPsaCertLookups(db);
           console.log(`Seeded ${seeded} PSA cert lookups from eBay listings.`);
+          let certsSinceMaterialize=0;
           await runQueue(db, {
-            queue: 'psa_cert', collector: createPsaCertCollector({ page, rateLimiter }),
+            queue: 'psa_cert', collector: createPsaCertCollector({ page, getPage:ensurePage, rateLimiter }),
             concurrency: 1, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, cooldown,
+            onItemComplete:async(result)=>{
+              if(result.final!=='succeeded')return;
+              certsSinceMaterialize++;
+              if(certsSinceMaterialize<25)return;
+              certsSinceMaterialize=0;
+              await materialize(db,{includeTcgdex:false,includePsa:false,includeEbay:true,includeEcb:false});
+              console.log('Incremental eBay rematch materialized after 25 PSA certs.');
+            },
           });
         }
       } finally {

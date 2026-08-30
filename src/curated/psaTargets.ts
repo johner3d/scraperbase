@@ -21,7 +21,7 @@ import { cardFactsUrl, PSA_BASE } from '../sources/psa/config.ts';
  */
 
 export interface MatchedTargetOptions {
-  /** Restrict to these `ebay_listings.match_tier` values. Undefined = every tier. */
+  /** Restrict tiers. Undefined applies the production precision-first policy. */
   tiers?: readonly string[];
   /** Drop listings the matcher accepted but flagged for a human glance. */
   excludeFlagged?: boolean;
@@ -70,12 +70,13 @@ interface SpecRow {
 function listingClauses(options: MatchedTargetOptions): { sql: string; params: string[] } {
   const clauses = [`e.variant_id IS NOT NULL`, `e.match_status IN ('matched', 'manual')`];
   const params: string[] = [];
-  const tiers = options.liveAuctionsOnly ? ['exact', 'strong'] : options.tiers;
+  const tiers = options.liveAuctionsOnly ? ['exact', 'strong'] : (options.tiers ?? ['exact', 'strong']);
   if (tiers && tiers.length > 0) {
     clauses.push(`e.match_tier IN (${tiers.map(() => '?').join(', ')})`);
     params.push(...tiers);
   }
-  if (options.excludeFlagged || options.liveAuctionsOnly) clauses.push(`e.flagged = 0`);
+  // Flagged and cluster-propagated matches are never production targets.
+  clauses.push(`e.flagged = 0`, `(e.match_method IS NULL OR e.match_method <> 'ebay-cluster-propagate')`);
   if (options.liveAuctionsOnly) clauses.push(`e.is_lot = 0`, `e.grade_value = 10`);
   return { sql: clauses.join(' AND '), params };
 }
@@ -85,21 +86,30 @@ export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTarge
 
   // GROUP BY ps.spec_id is the deduplication: 2,746 matched listings collapse
   // to one fetch per spec. COUNT(DISTINCT ...) reports what is behind them.
+  //
+  // nextFutureEnd picks out specs still backed by a live auction (item_end_date
+  // in the future) and, among those, the one ending soonest. The ORDER BY puts
+  // every such spec ahead of specs whose matched listings have all already
+  // ended -- PSA facts are only useful to a listing while it is still sellable,
+  // so a fetch budget must drain toward what's about to close, never toward
+  // auctions that are already history.
   const rows = db.prepare(`
     SELECT s.source_set_id AS release, s.source_set_id || '-' || c.local_id AS sourceCardId,
       COALESCE(v.finish, 'unknown') AS finish,
       COALESCE(v.print_run_marker, 'unknown') AS printRunMarker,
       v.micro_variant AS microVariant, ps.spec_id AS specId,
       v.variant_id AS variantId,
-      COUNT(DISTINCT e.ebay_listing_id) AS listings
+      COUNT(DISTINCT e.ebay_listing_id) AS listings,
+      MIN(CASE WHEN lp.item_end_date > datetime('now') THEN lp.item_end_date END) AS nextFutureEnd
     FROM ebay_listings e
     JOIN psa_specs ps ON ps.variant_id = e.variant_id AND ps.namespace = 'population'
     JOIN variants v ON v.variant_id = ps.variant_id
     JOIN cards c ON c.card_id = v.card_id
     JOIN sets s ON s.set_id = c.set_id
+    LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id = e.ebay_listing_id
     WHERE ${where}
     GROUP BY ps.spec_id
-    ORDER BY s.release_date, s.source_set_id, c.local_sort_key, ps.spec_id
+    ORDER BY (nextFutureEnd IS NULL) ASC, nextFutureEnd ASC, s.release_date, s.source_set_id, c.local_sort_key, ps.spec_id
   `).all(...params) as unknown as SpecRow[];
 
   const unresolvedRows = db.prepare(`

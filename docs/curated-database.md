@@ -1,5 +1,7 @@
 # Curated database
 
+For production runs, use the resumable parent pipeline documented in [`pipeline.md`](./pipeline.md). The commands below remain useful for targeted recovery and development.
+
 The raw collectors and object store remain the acquisition layer. The
 application-facing catalogue is materialized into the same SQLite database by:
 

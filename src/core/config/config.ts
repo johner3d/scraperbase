@@ -17,3 +17,5 @@ export const MEDIA_CACHE_DIR = path.join(DATA_DIR, 'media-cache');
 export const PSA_PROFILE_DIR = path.join(DATA_DIR, 'psa-browser-profile');
 export const EBAY_RAW_DIR = path.join(DATA_DIR, 'ebay-raw');
 export const EBAY_RAW_TMP_DIR = path.join(EBAY_RAW_DIR, 'tmp');
+export const PUBLISHED_DIR = path.join(DATA_DIR, 'published');
+export const PUBLISHED_POINTER_PATH = path.join(PUBLISHED_DIR, 'current.json');
