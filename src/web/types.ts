@@ -169,6 +169,22 @@ export interface MatchReviewItem {
   sourceKey: string;
   reason: string;
   createdAt: string;
+  /** eBay listings only: the title and the evidence behind the reason, so a reviewer can decide without opening the raw payload. */
+  title: string | null;
+  matchTier: string | null;
+  score: number | null;
+  runnerUpScore: number | null;
+  /** Ranked candidate cards the matcher was choosing between, best first. */
+  candidates: MatchReviewCandidate[];
+  /** What was read out of the listing: numbers, set text, language, species-bearing aspects. */
+  signals: Record<string, unknown> | null;
+}
+
+export interface MatchReviewCandidate {
+  cardId: number;
+  label: string;
+  score: number;
+  features: string[];
 }
 
 export interface HealthData {
@@ -177,6 +193,95 @@ export interface HealthData {
   catalogue: { sets: number; cards: number; variants: number };
   psa: { specs: number; sales: number };
   lastMaterialization: string | null;
+}
+
+export interface FxRateMeta {
+  baseCurrency: 'EUR';
+  quoteCurrency: 'USD';
+  rate: number;
+  rateDate: string;
+  observedAt: string;
+  stale: boolean;
+  usable: boolean;
+}
+
+export interface AuctionComparison {
+  psaGuideUsd: number | null;
+  psaGuideEur: number | null;
+  discountPercent: number | null;
+  fxRateDate: string | null;
+}
+
+export interface AuctionPriceObservation {
+  observationId: number;
+  observedAt: string;
+  price: number | null;
+  currentBid: number | null;
+  minimumBid: number | null;
+  currency: string | null;
+  bidCount: number | null;
+  endAt: string | null;
+  buyingOptions: string[];
+}
+
+export interface AuctionSearchItem {
+  auctionId: number;
+  itemId: string;
+  marketplace: string;
+  title: string;
+  itemUrl: string | null;
+  imageUrl: string | null;
+  matchTier: 'exact' | 'strong';
+  certNumber: string | null;
+  variant: VariantSearchItem;
+  currentBid: number | null;
+  minimumBid: number | null;
+  currency: string | null;
+  bidCount: number;
+  endAt: string | null;
+  observedAt: string;
+  shippingCost: number | null;
+  shippingCurrency: string | null;
+  shippingService: string | null;
+  active: boolean;
+  stale: boolean;
+  comparison: AuctionComparison;
+}
+
+export interface AuctionSummary {
+  active: number;
+  ending24Hours: number;
+  withPsaGuide: number;
+  medianDiscountPercent: number | null;
+}
+
+export interface AuctionPageData extends Page<AuctionSearchItem> {
+  summary: AuctionSummary;
+  lastObservedAt: string | null;
+  fx: FxRateMeta | null;
+}
+
+export interface AuctionFacetsData {
+  languages: string[];
+  sets: Array<{ id: string; name: string; language: string }>;
+}
+
+export interface AuctionDetail {
+  auction: AuctionSearchItem & {
+    subtitle: string | null;
+    condition: string | null;
+    sellerUsername: string | null;
+    sellerFeedbackScore: number | null;
+    sellerFeedbackPercent: number | null;
+    locationCountry: string | null;
+    locationText: string | null;
+    returnsAccepted: boolean | null;
+  };
+  priceHistory: AuctionPriceObservation[];
+  variant: VariantDetail;
+  market: MarketData;
+  population: PopulationData;
+  fx: FxRateMeta | null;
 }
 
 export interface ApiError { error: string; detail?: string }

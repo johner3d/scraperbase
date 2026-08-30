@@ -63,6 +63,28 @@ test('psaSetMatch: a heading with no plausible tcgdex candidate is left unmatche
   });
 });
 
+test('psaSetMatch: a specific Diamond & Pearl expansion beats the generic era name', async () => {
+  await withDb((db) => {
+    db.prepare(
+      `INSERT INTO sets (language, source_set_id, name, series, total_cards, created_at, updated_at)
+       VALUES ('en', 'dp1', 'Diamond & Pearl', 'Diamond & Pearl', 130, ?, ?),
+              ('en', 'dp7', 'Stormfront', 'Diamond & Pearl', 106, ?, ?)`,
+    ).run(NOW, NOW, NOW, NOW);
+    const candidates = scoreCandidates(db, 'Pokemon Diamond &amp; Pearl Stormfront');
+    assert.equal(candidates[0]?.sourceSetId, 'dp7');
+  });
+});
+
+test('psaSetMatch: accented Pokémon is treated as the same stopword as Pokemon', async () => {
+  await withDb((db) => {
+    db.prepare(
+      `INSERT INTO sets (language, source_set_id, name, series, total_cards, created_at, updated_at)
+       VALUES ('en', 'ru1', 'Pokémon Rumble', 'Platinum', 16, ?, ?)`,
+    ).run(NOW, NOW);
+    assert.equal(scoreCandidates(db, 'Pokemon Rumble')[0]?.sourceSetId, 'ru1');
+  });
+});
+
 function pikachuRow(overrides: Partial<PsaSetItemRow> = {}): PsaSetItemRow {
   return {
     SpecID: 525134,

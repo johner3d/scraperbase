@@ -22,11 +22,14 @@ import { PCGSEARCH_IMAGES_QUEUE, seedPcgSearchDiscovery } from '../../sources/pc
 import { createPcgSearchImageCollector } from '../../sources/pcgsearch/collectors/images.ts';
 import { linkPcgSearchAssets } from '../../sources/pcgsearch/link.ts';
 import { DATA_DIR } from '../../core/config/config.ts';
-import { seedEbaySearch } from '../../sources/ebay/discovery.ts';
+import { seedEbayLiveAuctionSearch, seedEbaySearch } from '../../sources/ebay/discovery.ts';
 import { createEbaySearchCollector } from '../../sources/ebay/collectors/search.ts';
 import { createEbayItemDetailCollector } from '../../sources/ebay/collectors/itemDetail.ts';
 import {
+  DEFAULT_EBAY_ENDING_WITHIN_HOURS,
+  DEFAULT_EBAY_LIVE_AUCTION_QUERY,
   DEFAULT_EBAY_MAX_ITEMS,
+  DEFAULT_EBAY_MIN_BID_COUNT,
   DEFAULT_EBAY_PAGE_LIMIT,
   DEFAULT_EBAY_QUERY,
   EBAY_MARKETPLACES,
@@ -36,8 +39,12 @@ import { printEbayRunSummary } from '../../sources/ebay/summary.ts';
 import { launchPsaProfile } from '../../sources/psa/browser/profile.ts';
 import { createPsaPopDiscoveryCollector, seedPsaPopDiscovery } from '../../sources/psa/collectors/popDiscovery.ts';
 import { createPsaSetItemsCollector } from '../../sources/psa/collectors/setItems.ts';
+import { createPsaCertCollector, seedPsaCertLookups } from '../../sources/psa/collectors/cert.ts';
+import { seedEcbRates } from '../../sources/ecb/discovery.ts';
+import { createEcbRatesCollector } from '../../sources/ecb/collector.ts';
+import { ECB_RATES_QUEUE } from '../../sources/ecb/config.ts';
 
-export type AcquisitionStage = 'index' | 'details' | 'images' | 'all';
+export type AcquisitionStage = 'index' | 'details' | 'images' | 'cert' | 'all';
 export type DetailPriority = 'psa' | 'all';
 
 export interface RunCliOptions {
@@ -79,12 +86,17 @@ export async function runCommand(args: string[]): Promise<void> {
       lang: { type: 'string', default: DEFAULT_TCGDEX_LANGUAGES.join(',') },
       stage: { type: 'string', default: 'index' },
       priority: { type: 'string', default: 'psa' },
-      query: { type: 'string', default: DEFAULT_EBAY_QUERY },
+      // No static default: which query applies depends on --live-auctions
+      // (see below) -- 'pokemon psa 10' there, 'pikachu psa 10' otherwise.
+      query: { type: 'string' },
       // DE is the only currently live-verified complete scope. EU needs a
       // separate quota window; international also needs >10k partitioning.
       marketplaces: { type: 'string', default: 'de' },
       'max-items': { type: 'string', default: String(DEFAULT_EBAY_MAX_ITEMS) },
       limit: { type: 'string', default: String(DEFAULT_EBAY_PAGE_LIMIT) },
+      'live-auctions': { type: 'boolean', default: false },
+      'min-bids': { type: 'string', default: String(DEFAULT_EBAY_MIN_BID_COUNT) },
+      'ending-within-hours': { type: 'string', default: String(DEFAULT_EBAY_ENDING_WITHIN_HOURS) },
     },
   });
 
@@ -99,7 +111,7 @@ export async function runCommand(args: string[]): Promise<void> {
     stage: values.stage as AcquisitionStage,
     priority: values.priority as DetailPriority,
   };
-  if (!['index', 'details', 'images', 'all'].includes(opts.stage)) throw new Error(`Invalid --stage ${opts.stage}`);
+  if (!['index', 'details', 'images', 'cert', 'all'].includes(opts.stage)) throw new Error(`Invalid --stage ${opts.stage}`);
   if (!['psa', 'all'].includes(opts.priority)) throw new Error(`Invalid --priority ${opts.priority}`);
 
   const db = openCliDb();
@@ -193,8 +205,6 @@ export async function runCommand(args: string[]): Promise<void> {
         logEvent(db, { runId, level: 'info', category: 'system', message: `Linked ${linked} PCG Search image(s) to cards` });
       }
     } else if (opts.source === 'ebay') {
-      const query = values.query as string;
-      const maxItems = Number(values['max-items']);
       const limit = Number(values.limit);
       const requestedMarketplaces = (values.marketplaces as string)
         .split(',')
@@ -204,26 +214,60 @@ export async function runCommand(args: string[]): Promise<void> {
       if (invalidMarketplaces.length > 0) throw new Error(`Invalid --marketplaces: ${invalidMarketplaces.join(', ')}`);
       const marketplaces = requestedMarketplaces as EbayMarketplaceKey[];
       if (marketplaces.length === 0) throw new Error('--marketplaces must contain at least one marketplace');
-      if (!query.trim()) throw new Error('--query must not be empty');
-      if (!Number.isInteger(maxItems) || maxItems < 0) throw new Error('--max-items must be a non-negative integer (0 means uncapped)');
       if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('--limit must be an integer from 1 to 200');
-      if (maxItems > limit && maxItems % limit !== 0) {
-        throw new Error('--max-items must be a multiple of --limit when it spans more than one page');
-      }
       const rateLimiter = createRateLimiter({ minDelayMs: 250, jitterMs: 150 });
 
-      for (const marketplace of marketplaces) {
-        seedEbaySearch(db, { marketplace, query, limit, maxItems });
-        await runQueue(db, {
-          queue: 'ebay_search', collector: createEbaySearchCollector({ rateLimiter }),
-          concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
-        });
-        await runQueue(db, {
-          queue: 'ebay_item_detail', collector: createEbayItemDetailCollector({ rateLimiter }),
-          concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
-        });
+      if (values['live-auctions']) {
+        const query = (values.query as string | undefined) ?? DEFAULT_EBAY_LIVE_AUCTION_QUERY;
+        const minBidCount = Number(values['min-bids']);
+        const endingWithinHours = Number(values['ending-within-hours']);
+        if (!query.trim()) throw new Error('--query must not be empty');
+        if (!Number.isInteger(minBidCount) || minBidCount < 0) throw new Error('--min-bids must be a non-negative integer');
+        if (!Number.isFinite(endingWithinHours) || endingWithinHours <= 0) throw new Error('--ending-within-hours must be a positive number');
+
+        for (const marketplace of marketplaces) {
+          seedEbayLiveAuctionSearch(db, { marketplace, query, limit, minBidCount, endingWithinHours });
+          logEvent(db, {
+            runId, level: 'info', category: 'system',
+            message: `Seeded live-auction search "${query}" for marketplace ${marketplace} (min ${minBidCount} bid(s), ending within ${endingWithinHours}h)`,
+          });
+          await runQueue(db, {
+            queue: 'ebay_search', collector: createEbaySearchCollector({ rateLimiter }),
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+          });
+          await runQueue(db, {
+            queue: 'ebay_item_detail', collector: createEbayItemDetailCollector({ rateLimiter }),
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+          });
+        }
+      } else {
+        const query = (values.query as string | undefined) ?? DEFAULT_EBAY_QUERY;
+        const maxItems = Number(values['max-items']);
+        if (!query.trim()) throw new Error('--query must not be empty');
+        if (!Number.isInteger(maxItems) || maxItems < 0) throw new Error('--max-items must be a non-negative integer (0 means uncapped)');
+        if (maxItems > limit && maxItems % limit !== 0) {
+          throw new Error('--max-items must be a multiple of --limit when it spans more than one page');
+        }
+
+        for (const marketplace of marketplaces) {
+          seedEbaySearch(db, { marketplace, query, limit, maxItems });
+          await runQueue(db, {
+            queue: 'ebay_search', collector: createEbaySearchCollector({ rateLimiter }),
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+          });
+          await runQueue(db, {
+            queue: 'ebay_item_detail', collector: createEbayItemDetailCollector({ rateLimiter }),
+            concurrency: opts.concurrency, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+          });
+        }
       }
       printEbayRunSummary(db, runId);
+    } else if (opts.source === 'ecb') {
+      seedEcbRates(db);
+      await runQueue(db, {
+        queue: ECB_RATES_QUEUE, collector: createEcbRatesCollector(createRateLimiter({ minDelayMs: 0, jitterMs: 0 })),
+        concurrency: 1, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining,
+      });
     } else if (opts.source === 'psa') {
       // Native discovery of PSA's own population-report tree (see
       // src/sources/psa/collectors/popDiscovery.ts) -- replaces the old
@@ -250,6 +294,20 @@ export async function runCommand(args: string[]): Promise<void> {
         if (opts.stage === 'details' || opts.stage === 'all') {
           await runQueue(db, {
             queue: 'psa_pop_set_items', collector: createPsaSetItemsCollector({ page, rateLimiter }),
+            concurrency: 1, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, cooldown,
+          });
+        }
+        // Certification numbers published on eBay listings, resolved back to
+        // the spec PSA graded them under. This is the only exact eBay->variant
+        // path there is, and it doubles as the precision baseline the scored
+        // matcher is measured against -- so it is its own stage rather than
+        // part of `all`, and is run on demand once eBay data has been
+        // materialized.
+        if (opts.stage === 'cert') {
+          const seeded = seedPsaCertLookups(db);
+          console.log(`Seeded ${seeded} PSA cert lookups from eBay listings.`);
+          await runQueue(db, {
+            queue: 'psa_cert', collector: createPsaCertCollector({ page, rateLimiter }),
             concurrency: 1, leaseTtlMs: opts.leaseTtlMs, runId, isDraining: () => draining, cooldown,
           });
         }

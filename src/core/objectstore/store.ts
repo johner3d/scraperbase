@@ -5,7 +5,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { OBJECTS_DIR, OBJECTS_TMP_DIR } from '../config/config.ts';
 import { sha256Hex } from './hash.ts';
 
-export type MediaKind = 'json' | 'html' | 'image';
+export type MediaKind = 'json' | 'html' | 'xml' | 'image';
 
 export interface WriteObjectInput {
   source: string;       // 'tcgdex' | 'psa'

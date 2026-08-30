@@ -13,22 +13,25 @@ export async function materializeCommand(args: string[]): Promise<void> {
       'no-tcgdex': { type: 'boolean', default: false },
       'no-psa': { type: 'boolean', default: false },
       'no-ebay': { type: 'boolean', default: false },
+      'no-ecb': { type: 'boolean', default: false },
       source: { type: 'string', default: 'all' },
     },
   });
 
   const psaDir = values['psa-dir'] as string | undefined;
   const source = String(values.source);
-  if (!['tcgdex', 'psa', 'ebay', 'all'].includes(source)) throw new Error(`Invalid --source ${source}`);
+  if (!['tcgdex', 'psa', 'ebay', 'ecb', 'all'].includes(source)) throw new Error(`Invalid --source ${source}`);
   const includeTcgdex = !values['no-tcgdex'] && (source === 'all' || source === 'tcgdex');
   const includePsa = !values['no-psa'] && (source === 'all' || source === 'psa');
   const includeEbay = !values['no-ebay'] && (source === 'all' || source === 'ebay');
+  const includeEcb = !values['no-ecb'] && (source === 'all' || source === 'ecb');
   const db = openCliDb();
   const runId = createRun(db, 'materialize', {
     psaDir: psaDir ?? `${DATA_DIR}/psa-raw`,
     includeTcgdex,
     includePsa,
     includeEbay,
+    includeEcb,
   }, true);
   logEvent(db, { runId, level: 'info', category: 'materialization', message: 'Curated materialization started' });
 
@@ -38,6 +41,7 @@ export async function materializeCommand(args: string[]): Promise<void> {
       includeTcgdex,
       includePsa,
       includeEbay,
+      includeEcb,
     });
     finishRun(db, runId, 'completed');
     console.log(JSON.stringify({ runId, ...result }, null, 2));

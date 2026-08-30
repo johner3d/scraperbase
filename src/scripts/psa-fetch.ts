@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { Page } from 'playwright';
 import { launchPsaProfile } from '../sources/psa/browser/profile.ts';
-import { DATA_DIR } from '../core/config/config.ts';
+import { DATA_DIR, DB_PATH } from '../core/config/config.ts';
 
 // Bulk PSA raw fetcher: population + sales for a curated selection of
 // {psaSpecId/salesSpecId, sourceUrl} entries, grouped by release ("slice").
@@ -22,6 +23,7 @@ const EVALUATE_TIMEOUT_MS = 25_000;
 const BOOTSTRAP_URL = 'https://www.psacard.com/cardfacts/pokemon/base-set/card/641285';
 const COOLDOWN_AFTER_CONSECUTIVE_FAILURES = 3;
 const COOLDOWN_MS = 60_000;
+const STOP_FILE = path.join(DATA_DIR, 'psa-fetch.stop');
 
 interface Selection {
   release: string;
@@ -66,6 +68,19 @@ interface Options {
   offset: number;
   force: boolean;
   since: string;
+  fromDb: boolean;
+  throughYear: number | null;
+}
+
+let stopRequested = false;
+const salesCheckpointPaths = new Map<string, string[]>();
+
+function shouldStop(): boolean {
+  if (!stopRequested && fs.existsSync(STOP_FILE)) {
+    stopRequested = true;
+    console.warn(`\nStop marker detected at ${STOP_FILE}; saving the current page checkpoint, then stopping...`);
+  }
+  return stopRequested;
 }
 
 function parseOptions(argv: readonly string[]): Options {
@@ -74,6 +89,8 @@ function parseOptions(argv: readonly string[]): Options {
   let limit: number | null = null;
   let offset = 0;
   let force = false;
+  let fromDb = false;
+  let throughYear: number | null = null;
   const cutoff = new Date();
   cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 2);
   let since = cutoff.toISOString().slice(0, 10);
@@ -87,6 +104,8 @@ function parseOptions(argv: readonly string[]): Options {
     } else if (arg.startsWith('--limit=')) limit = Number(arg.slice('--limit='.length));
     else if (arg.startsWith('--offset=')) offset = Number(arg.slice('--offset='.length));
     else if (arg.startsWith('--since=')) since = arg.slice('--since='.length);
+    else if (arg === '--from-db') fromDb = true;
+    else if (arg.startsWith('--through-year=')) throughYear = Number(arg.slice('--through-year='.length));
     else if (arg === '--force') force = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
@@ -94,8 +113,110 @@ function parseOptions(argv: readonly string[]): Options {
   if (limit !== null && (!Number.isSafeInteger(limit) || limit <= 0)) throw new Error('--limit must be a positive integer');
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('--offset must be a non-negative integer');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) throw new Error(`Invalid --since date: ${since}`);
+  if (throughYear !== null && (!Number.isSafeInteger(throughYear) || throughYear < 1996 || throughYear > 2100)) {
+    throw new Error('--through-year must be an integer from 1996 to 2100');
+  }
+  if (throughYear !== null && !fromDb) throw new Error('--through-year requires --from-db');
 
-  return { releases, only, limit, offset, force, since };
+  return { releases, only, limit, offset, force, since, fromDb, throughYear };
+}
+
+function atomicWriteJson(filePath: string, value: unknown): void {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(value, null, 2) + '\n');
+  fs.renameSync(tempPath, filePath);
+}
+
+function indexSalesCheckpoints(): void {
+  salesCheckpointPaths.clear();
+  if (!fs.existsSync(OUT_DIR)) return;
+  for (const release of fs.readdirSync(OUT_DIR, { withFileTypes: true })) {
+    if (!release.isDirectory()) continue;
+    const salesDir = path.join(OUT_DIR, release.name, 'sales');
+    if (!fs.existsSync(salesDir)) continue;
+    for (const file of fs.readdirSync(salesDir)) {
+      const match = /^(\d+)\.json$/.exec(file);
+      if (!match) continue;
+      const paths = salesCheckpointPaths.get(match[1]!) ?? [];
+      paths.push(path.join(salesDir, file));
+      salesCheckpointPaths.set(match[1]!, paths);
+    }
+  }
+}
+
+interface SavedSalesCheckpoint {
+  cutoffIso?: string;
+  coverageComplete?: boolean;
+  sales?: RawApiSale[];
+  totalCount?: number;
+  pagesFetched?: number;
+}
+
+function bestSalesCheckpoint(specId: number, preferredPath: string, cutoffIso: string): { path: string; saved: SavedSalesCheckpoint } | null {
+  const candidates = [preferredPath, ...(salesCheckpointPaths.get(String(specId)) ?? []).filter((p) => p !== preferredPath)];
+  let best: { path: string; saved: SavedSalesCheckpoint } | null = null;
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+    try {
+      const saved = JSON.parse(fs.readFileSync(candidate, 'utf8')) as SavedSalesCheckpoint;
+      if (saved.cutoffIso !== cutoffIso) continue;
+      if (!best || Boolean(saved.coverageComplete) > Boolean(best.saved.coverageComplete)
+        || (Boolean(saved.coverageComplete) === Boolean(best.saved.coverageComplete)
+          && (saved.pagesFetched ?? 0) > (best.saved.pagesFetched ?? 0))) {
+        best = { path: candidate, saved };
+      }
+    } catch { /* ignore invalid checkpoints */ }
+  }
+  return best;
+}
+
+function selectionsFromDb(options: Options): Selection[] {
+  const db = new DatabaseSync(DB_PATH);
+  try {
+    const clauses = [
+      `ps.namespace = 'population'`,
+      `ps.match_status IN ('matched', 'manual')`,
+      `s.language = 'en'`,
+      `s.series <> 'Pokémon TCG Pocket'`,
+    ];
+    const params: Array<string> = [];
+    if (options.throughYear !== null) {
+      clauses.push('s.release_date < ?');
+      params.push(`${options.throughYear + 1}-01-01`);
+    }
+    const rows = db.prepare(`
+      SELECT s.source_set_id AS release, s.source_set_id || '-' || c.local_id AS sourceCardId,
+        COALESCE(v.finish, 'unknown') AS finish,
+        COALESCE(v.print_run_marker, 'unknown') AS printRunMarker,
+        v.micro_variant AS microVariant, ps.spec_id AS specId
+      FROM psa_specs ps
+      JOIN variants v ON v.variant_id = ps.variant_id
+      JOIN cards c ON c.card_id = v.card_id
+      JOIN sets s ON s.set_id = c.set_id
+      WHERE ${clauses.join(' AND ')}
+      GROUP BY ps.spec_id
+      ORDER BY s.release_date, s.source_set_id, c.local_sort_key, ps.spec_id
+    `).all(...params) as unknown as Array<{
+      release: string; sourceCardId: string; finish: string; printRunMarker: string;
+      microVariant: string | null; specId: string;
+    }>;
+    return rows.map((row) => {
+      const specId = Number(row.specId);
+      return {
+        release: row.release,
+        sourceCardId: row.sourceCardId,
+        finish: row.finish,
+        printRunMarker: row.printRunMarker,
+        microVariant: row.microVariant ?? undefined,
+        psaSpecId: specId,
+        popSourceUrl: `https://www.psacard.com/spec/psa/${specId}`,
+        salesSpecId: specId,
+        salesSourceUrl: `https://www.psacard.com/spec/psa/${specId}`,
+      };
+    });
+  } finally {
+    db.close();
+  }
 }
 
 function slice<T>(list: T[], options: Options): T[] {
@@ -224,20 +345,28 @@ async function fetchPopulationOne(page: Page, entry: Selection, outDir: string):
     EVALUATE_TIMEOUT_MS,
     `page fetch (spec ${entry.psaSpecId})`,
   );
-  fs.writeFileSync(
-    path.join(outDir, `${entry.psaSpecId}.json`),
-    JSON.stringify({ ...entry, fetchedAt: new Date().toISOString(), populationRaw, priceRows, censusRows, html }, null, 2) + '\n',
-  );
+  atomicWriteJson(path.join(outDir, `${entry.psaSpecId}.json`), {
+    ...entry, fetchedAt: new Date().toISOString(), populationRaw, priceRows, censusRows, html,
+  });
   console.log(`  saved (${priceRows.length} price rows, ${censusRows.length} census rows, ${html.length} bytes of page HTML)`);
 }
 
 async function fetchSalesOne(page: Page, entry: Selection, outDir: string, cutoffIso: string): Promise<void> {
-  const allSales: RawApiSale[] = [];
+  const outPath = path.join(outDir, `${entry.salesSpecId}.json`);
+  let allSales: RawApiSale[] = [];
   let totalCount = 0;
   let pagesFetched = 0;
   let reachedCutoff = false;
 
-  for (let pageNumber = 1; pageNumber <= SALES_MAX_PAGES; pageNumber++) {
+  const checkpoint = bestSalesCheckpoint(entry.salesSpecId!, outPath, cutoffIso);
+  if (checkpoint && !checkpoint.saved.coverageComplete) {
+    allSales = checkpoint.saved.sales ?? [];
+    totalCount = checkpoint.saved.totalCount ?? 0;
+    pagesFetched = checkpoint.saved.pagesFetched ?? 0;
+    if (pagesFetched > 0) console.log(`  resuming after page ${pagesFetched} (${allSales.length} saved sale rows from ${checkpoint.path})`);
+  }
+
+  for (let pageNumber = pagesFetched + 1; pageNumber <= SALES_MAX_PAGES; pageNumber++) {
     const { sales, totalCount: total } = await fetchSalesPage(page, entry.salesSpecId!, pageNumber);
     totalCount = total;
     pagesFetched++;
@@ -249,19 +378,22 @@ async function fetchSalesOne(page: Page, entry: Selection, outDir: string, cutof
     const oldestIso = new Date(sales.at(-1)!.saleDate).toISOString().slice(0, 10);
     if (oldestIso < cutoffIso) {
       reachedCutoff = true;
-      break;
     }
+    atomicWriteJson(outPath, {
+      ...entry, fetchedAt: new Date().toISOString(), grade: '10', cutoffIso,
+      totalCount, pagesFetched, coverageComplete: reachedCutoff, sales: allSales,
+    });
+    if (reachedCutoff || shouldStop()) break;
     await page.waitForTimeout(SALES_REQUEST_DELAY_MS);
   }
 
-  fs.writeFileSync(
-    path.join(outDir, `${entry.salesSpecId}.json`),
-    JSON.stringify(
-      { ...entry, fetchedAt: new Date().toISOString(), grade: '10', cutoffIso, totalCount, pagesFetched, coverageComplete: reachedCutoff, sales: allSales },
-      null,
-      2,
-    ) + '\n',
-  );
+  atomicWriteJson(outPath, {
+    ...entry, fetchedAt: new Date().toISOString(), grade: '10', cutoffIso,
+    totalCount, pagesFetched, coverageComplete: reachedCutoff, sales: allSales,
+  });
+  const knownPaths = salesCheckpointPaths.get(String(entry.salesSpecId)) ?? [];
+  if (!knownPaths.includes(outPath)) knownPaths.push(outPath);
+  salesCheckpointPaths.set(String(entry.salesSpecId), knownPaths);
   console.log(`  saved ${allSales.length} sale row(s) across ${pagesFetched} page(s) (${totalCount} total on PSA, coverageComplete=${reachedCutoff})`);
 }
 
@@ -270,6 +402,7 @@ async function runPopulation(page: Page, release: string, entries: Selection[], 
   fs.mkdirSync(outDir, { recursive: true });
   let done = 0, skipped = 0, failed = 0, consecutiveFailures = 0;
   for (const entry of entries) {
+    if (shouldStop()) break;
     const outPath = path.join(outDir, `${entry.psaSpecId}.json`);
     if (!force && fs.existsSync(outPath)) { skipped++; continue; }
     console.log(`[pop/${release}] ${entry.sourceCardId} ${entry.finish}/${entry.printRunMarker} (spec ${entry.psaSpecId})...`);
@@ -308,8 +441,12 @@ async function runSales(page: Page, release: string, entries: Selection[], force
 
   let done = 0, skipped = 0, failed = 0, consecutiveFailures = 0;
   for (const entry of withSalesId) {
+    if (shouldStop()) break;
     const outPath = path.join(outDir, `${entry.salesSpecId}.json`);
-    if (!force && fs.existsSync(outPath)) { skipped++; continue; }
+    if (!force) {
+      const checkpoint = bestSalesCheckpoint(entry.salesSpecId, outPath, cutoffIso);
+      if (checkpoint?.saved.coverageComplete) { skipped++; continue; }
+    }
     console.log(`[sales/${release}] ${entry.sourceCardId} ${entry.finish}/${entry.printRunMarker} (spec ${entry.salesSpecId})...`);
     try {
       await fetchSalesOne(page, entry, outDir, cutoffIso);
@@ -328,8 +465,19 @@ async function runSales(page: Page, release: string, entries: Selection[], force
 
 async function main(): Promise<void> {
   const options = parseOptions(process.argv.slice(2));
-  const all = JSON.parse(fs.readFileSync(SELECTION_PATH, 'utf8')) as Selection[];
+  const all = options.fromDb
+    ? selectionsFromDb(options)
+    : JSON.parse(fs.readFileSync(SELECTION_PATH, 'utf8')) as Selection[];
   const releaseOrder = options.releases ?? [...new Set(all.map((e) => e.release))];
+  indexSalesCheckpoints();
+
+  const requestStop = (signal: string) => {
+    if (stopRequested) return;
+    stopRequested = true;
+    console.warn(`\nReceived ${signal}; saving the current page checkpoint, then stopping...`);
+  };
+  process.once('SIGINT', () => requestStop('SIGINT'));
+  process.once('SIGTERM', () => requestStop('SIGTERM'));
 
   const context = await launchPsaProfile({ headless: false });
   const page = await context.newPage();
@@ -338,6 +486,7 @@ async function main(): Promise<void> {
     await page.goto(BOOTSTRAP_URL, { waitUntil: 'domcontentloaded', timeout: 180_000 });
 
     for (const release of releaseOrder) {
+      if (shouldStop()) break;
       const entries = slice(all.filter((e) => e.release === release), options);
       if (entries.length === 0) continue;
       console.log(`\n=== ${release}: ${entries.length} entrie(s) ===`);

@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type {
-  CardDetail, CardSearchItem, FacetsData, HealthData, MarketData, MatchReviewItem, Page,
+  AuctionDetail, AuctionFacetsData, AuctionPageData, AuctionPriceObservation, AuctionSearchItem,
+  CardDetail, CardSearchItem, FacetsData, FxRateMeta, HealthData, MarketData, MatchReviewItem, Page,
   PopulationData, SaleRow, SortOption, SourceStatus, VariantDetail, VariantSearchItem,
 } from './types.ts';
 
@@ -86,8 +87,10 @@ function variantMetricsCte(idFilter?: { sql: string; params: SqlValue[] }): { sq
       FROM latest_pop lp JOIN psa_population_current p ON p.population_spec_pk=lp.psa_spec_pk WHERE lp.rn=1 GROUP BY lp.variant_id),
     price AS (SELECT lp.variant_id,pc.psa_price latest_psa10_price,pc.average_price avg_psa10_price
       FROM latest_pop lp JOIN psa_price_current pc ON pc.population_spec_pk=lp.psa_spec_pk WHERE lp.rn=1 AND pc.grade_value=10),
-    latest_sales_spec AS (SELECT *,ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY fetched_at DESC,psa_spec_pk DESC) rn
-      FROM psa_specs WHERE namespace='sales' AND match_status IN ('matched','manual')${extra}),
+    latest_sales_spec AS (SELECT ps.*,ROW_NUMBER() OVER(PARTITION BY ps.variant_id ORDER BY
+      EXISTS(SELECT 1 FROM psa_sales s WHERE s.sales_spec_pk=ps.psa_spec_pk) DESC,
+      ps.fetched_at DESC,ps.psa_spec_pk DESC) rn
+      FROM psa_specs ps WHERE ps.namespace='sales' AND ps.match_status IN ('matched','manual')${extra}),
     ranked_sales AS (SELECT lss.variant_id,s.sale_price,s.sale_date,
       ROW_NUMBER() OVER(PARTITION BY lss.variant_id ORDER BY s.sale_date DESC,s.sale_row_id DESC) rn,
       COUNT(*) OVER(PARTITION BY lss.variant_id) sale_count,
@@ -191,7 +194,11 @@ export function getVariant(db:DatabaseSync,variantId:number):VariantDetail|null{
     cardAttributes:object(detail.card_attributes_json),matchedSourceCount:integer(detail.matched_source_count),assetCount:integer(detail.asset_count),relatedCard:related,
     sourceReferences:refs.map((ref)=>({source:String(ref.source),namespace:String(ref.namespace),sourceKey:String(ref.source_key),status:String(ref.match_status),url:text(ref.source_url)}))};
 }
-function matchedSpec(db:DatabaseSync,variantId:number,namespace:'population'|'sales'):Row|undefined{return db.prepare(`SELECT * FROM psa_specs WHERE variant_id=? AND namespace=? AND match_status IN ('matched','manual') ORDER BY fetched_at DESC,psa_spec_pk DESC LIMIT 1`).get(variantId,namespace) as Row|undefined}
+function matchedSpec(db:DatabaseSync,variantId:number,namespace:'population'|'sales'):Row|undefined{
+  const salesOrder=namespace==='sales'?`EXISTS(SELECT 1 FROM psa_sales s WHERE s.sales_spec_pk=ps.psa_spec_pk) DESC,`:'';
+  return db.prepare(`SELECT ps.* FROM psa_specs ps WHERE ps.variant_id=? AND ps.namespace=? AND ps.match_status IN ('matched','manual')
+    ORDER BY ${salesOrder} ps.fetched_at DESC,ps.psa_spec_pk DESC LIMIT 1`).get(variantId,namespace) as Row|undefined;
+}
 function sale(row:Row):SaleRow{return {saleRowId:integer(row.sale_row_id),saleItemId:String(row.sale_item_id),saleDate:text(row.sale_date),salePrice:number(row.sale_price),currency:String(row.currency??'USD'),gradeValue:number(row.grade_value),auctionHouse:text(row.auction_house),saleType:text(row.sale_type),certNumber:text(row.cert_number),lotNumber:text(row.lot_number),listingUrl:text(row.listing_url),qualifierCode:text(row.qualifier_code)}}
 export function getMarket(db:DatabaseSync,variantId:number):MarketData{
   const pop=matchedSpec(db,variantId,'population'),salesSpec=matchedSpec(db,variantId,'sales');
@@ -213,6 +220,102 @@ export function getPopulation(db:DatabaseSync,variantId:number):PopulationData{
   const total=integer(rows[0]?.total_population),gem10=grouped.get('10')?.populationCount??0;
   const prices=db.prepare(`SELECT * FROM psa_price_current WHERE population_spec_pk=? ORDER BY grade_order`).all(integer(spec.psa_spec_pk)) as unknown as Row[];
   return {available:true,observedAt:text(rows[0]?.observed_at),sourceUrl:text(spec.source_url),totalGraded:total,gemRate:total?gem10/total*100:null,grades:[...grouped.values()],prices:prices.map((row)=>({gradeKey:String(row.grade_key),gradeLabel:String(row.grade_label??row.grade_key),gradeValue:number(row.grade_value),mostRecentPrice:number(row.most_recent_price),averagePrice:number(row.average_price),psaPrice:number(row.psa_price)}))};
+}
+
+function latestFx(db:DatabaseSync,now:Date):FxRateMeta|null{
+  const row=db.prepare(`SELECT * FROM exchange_rates WHERE source='ecb' AND base_currency='EUR' AND quote_currency='USD'
+    ORDER BY rate_date DESC,exchange_rate_id DESC LIMIT 1`).get() as Row|undefined;
+  if(!row)return null;
+  const rateDate=String(row.rate_date),age=Math.max(0,(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())-new Date(`${rateDate}T00:00:00Z`).getTime())/86400000);
+  return{baseCurrency:'EUR',quoteCurrency:'USD',rate:Number(row.rate),rateDate,observedAt:String(row.observed_at),stale:age>1,usable:age<=7};
+}
+
+function auctionRows(db:DatabaseSync,auctionId?:number):Row[]{
+  const idSql=auctionId==null?'':'AND e.ebay_listing_id=?';
+  return db.prepare(`WITH latest_price AS (
+      SELECT *,ROW_NUMBER() OVER(PARTITION BY ebay_listing_id ORDER BY observed_at DESC,ebay_price_observation_id DESC) rn
+      FROM ebay_listing_price_observations)
+    SELECT e.*,lp.price_value auction_price,lp.price_currency auction_currency,lp.current_bid_price,lp.minimum_bid_price,
+      lp.bid_count,lp.item_end_date,lp.observed_at auction_observed_at,lp.buying_options_json,v.*
+    FROM ebay_listings e JOIN latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id AND lp.rn=1
+    JOIN v_variant_search v ON v.variant_id=e.variant_id
+    WHERE e.variant_id IS NOT NULL AND e.grade_value=10 AND e.is_lot=0 AND e.flagged=0 AND e.match_status IN ('matched','manual')
+      AND e.match_tier IN ('exact','strong') ${idSql}`).all(...(auctionId==null?[]:[auctionId])) as unknown as Row[];
+}
+
+function comparison(psaGuide:number|null,bid:number|null,currency:string|null,fx:FxRateMeta|null){
+  let eur:number|null=null,discount:number|null=null;
+  if(psaGuide!=null&&bid!=null){
+    const comparable=currency==='USD'?psaGuide:currency==='EUR'&&fx?.usable?psaGuide/fx.rate:null;
+    eur=fx?.usable?psaGuide/fx.rate:null;
+    if(comparable!=null&&comparable>0)discount=(comparable-bid)/comparable*100;
+  }
+  return{psaGuideUsd:psaGuide,psaGuideEur:eur,discountPercent:discount,fxRateDate:eur!=null?fx!.rateDate:null};
+}
+
+function auctionItem(db:DatabaseSync,row:Row,summary:VariantSummary,fx:FxRateMeta|null,now:Date):AuctionSearchItem{
+  const variant=variantItem(db,row,summary),bid=number(row.current_bid_price)??number(row.auction_price),end=text(row.item_end_date),observed=String(row.auction_observed_at);
+  return{auctionId:integer(row.ebay_listing_id),itemId:String(row.item_id),marketplace:String(row.marketplace),title:String(row.title),
+    itemUrl:text(row.item_web_url),imageUrl:text(row.primary_image_url)?`/media/ebay/${integer(row.ebay_listing_id)}`:null,
+    matchTier:text(row.match_tier)==='exact'?'exact':'strong',certNumber:text(row.cert_number),variant,currentBid:bid,
+    minimumBid:number(row.minimum_bid_price),currency:text(row.auction_currency),bidCount:integer(row.bid_count),endAt:end,observedAt:observed,
+    shippingCost:number(row.shipping_cost_value),shippingCurrency:text(row.shipping_cost_currency),shippingService:text(row.shipping_service),
+    active:Boolean(end&&new Date(end)>now),stale:now.getTime()-new Date(observed).getTime()>6*3600000,
+    comparison:comparison(variant.latestPsa10Price,bid,text(row.auction_currency),fx)};
+}
+
+function activeAuctions(db:DatabaseSync,now:Date):AuctionSearchItem[]{
+  const rows=auctionRows(db),summaries=summaryRows(db,rows.map((row)=>integer(row.variant_id))),fx=latestFx(db,now),cutoff=now.getTime()+72*3600000;
+  return rows.filter((row)=>strings(row.buying_options_json).includes('AUCTION')).map((row)=>auctionItem(db,row,summaries.get(integer(row.variant_id))??{},fx,now)).filter((item)=>
+    item.active&&item.bidCount>=1&&item.endAt!=null&&new Date(item.endAt).getTime()<=cutoff);
+}
+
+export function listAuctions(db:DatabaseSync,search:URLSearchParams,now=new Date()):AuctionPageData{
+  const fx=latestFx(db,now),all=activeAuctions(db,now),endingWithin=Math.min(72,Math.max(1,Number(search.get('endingWithin')??72)||72));
+  const q=(search.get('q')??'').trim().toLowerCase(),language=search.get('language'),set=search.get('set'),psaPrice=search.get('psaPrice')??'all';
+  const bidMin=number(search.get('bidMin')),bidMax=number(search.get('bidMax')),discountMin=number(search.get('discountMin'));
+  let items=all.filter((item)=>{
+    const endOk=item.endAt!=null&&new Date(item.endAt).getTime()<=now.getTime()+endingWithin*3600000;
+    const queryOk=!q||[item.title,item.variant.name,item.variant.setName,item.variant.number,item.variant.localId].some((value)=>String(value??'').toLowerCase().includes(q));
+    const setOk=!set||item.variant.sourceSetId===set||item.variant.setName===set;
+    const priceOk=psaPrice==='available'?item.comparison.psaGuideUsd!=null:psaPrice==='missing'?item.comparison.psaGuideUsd==null:true;
+    const bidOk=(bidMin==null||item.currentBid!=null&&item.currentBid>=bidMin)&&(bidMax==null||item.currentBid!=null&&item.currentBid<=bidMax);
+    return endOk&&queryOk&&(!language||item.variant.language===language)&&setOk&&priceOk&&bidOk&&(discountMin==null||item.comparison.discountPercent!=null&&item.comparison.discountPercent>=discountMin);
+  });
+  const sort=search.get('sort')??'opportunity_desc';
+  items.sort((a,b)=>sort==='ending_soon'?(a.endAt??'').localeCompare(b.endAt??''):
+    sort==='bids_desc'?b.bidCount-a.bidCount:
+    sort==='bid_asc'?(a.currentBid??Infinity)-(b.currentBid??Infinity):
+    sort==='bid_desc'?(b.currentBid??-Infinity)-(a.currentBid??-Infinity):
+    sort==='psa_price_desc'?(b.comparison.psaGuideUsd??-Infinity)-(a.comparison.psaGuideUsd??-Infinity):
+    (b.comparison.discountPercent??-Infinity)-(a.comparison.discountPercent??-Infinity)||(a.endAt??'').localeCompare(b.endAt??''));
+  const discounts=all.map((item)=>item.comparison.discountPercent).filter((value):value is number=>value!=null).sort((a,b)=>a-b),middle=Math.floor(discounts.length/2);
+  const median=discounts.length?(discounts.length%2?discounts[middle]!:(discounts[middle-1]!+discounts[middle]!)/2):null;
+  const {page,pageSize}=pageArgs(search),total=items.length,totalPages=Math.ceil(total/pageSize),safe=totalPages?Math.min(page,totalPages):1;
+  return{items:items.slice((safe-1)*pageSize,safe*pageSize),total,page:safe,pageSize,totalPages,
+    summary:{active:all.length,ending24Hours:all.filter((item)=>item.endAt!=null&&new Date(item.endAt).getTime()<=now.getTime()+24*3600000).length,
+      withPsaGuide:all.filter((item)=>item.comparison.psaGuideUsd!=null).length,medianDiscountPercent:median},
+    lastObservedAt:all.map((item)=>item.observedAt).sort().at(-1)??null,fx};
+}
+
+export function getAuctionFacets(db:DatabaseSync,now=new Date()):AuctionFacetsData{
+  const items=activeAuctions(db,now),sets=new Map<string,{id:string;name:string;language:string}>();
+  for(const item of items)sets.set(`${item.variant.language}:${item.variant.sourceSetId}`,{id:item.variant.sourceSetId,name:item.variant.setName,language:item.variant.language});
+  return{languages:[...new Set(items.map((item)=>item.variant.language))].sort(),sets:[...sets.values()].sort((a,b)=>a.name.localeCompare(b.name))};
+}
+
+export function getAuction(db:DatabaseSync,auctionId:number,now=new Date()):AuctionDetail|null{
+  const row=auctionRows(db,auctionId)[0];if(!row)return null;
+  const variantId=integer(row.variant_id),variant=getVariant(db,variantId);if(!variant)return null;
+  const fx=latestFx(db,now),item=auctionItem(db,row,summaryRows(db,[variantId]).get(variantId)??{},fx,now);
+  const history=db.prepare(`SELECT * FROM ebay_listing_price_observations WHERE ebay_listing_id=? ORDER BY observed_at,ebay_price_observation_id`).all(auctionId) as unknown as Row[];
+  const priceHistory:AuctionPriceObservation[]=history.map((entry)=>({observationId:integer(entry.ebay_price_observation_id),observedAt:String(entry.observed_at),
+    price:number(entry.price_value),currentBid:number(entry.current_bid_price),minimumBid:number(entry.minimum_bid_price),currency:text(entry.price_currency),
+    bidCount:number(entry.bid_count),endAt:text(entry.item_end_date),buyingOptions:strings(entry.buying_options_json)}));
+  return{auction:{...item,subtitle:text(row.subtitle),condition:text(row.condition_label),sellerUsername:text(row.seller_username),
+    sellerFeedbackScore:number(row.seller_feedback_score),sellerFeedbackPercent:number(row.seller_feedback_percent),locationCountry:text(row.item_location_country),
+    locationText:text(row.item_location_text),returnsAccepted:row.returns_accepted==null?null:Boolean(integer(row.returns_accepted))},
+    priceHistory,variant,market:getMarket(db,variantId),population:getPopulation(db,variantId),fx};
 }
 
 function rawStats(db:DatabaseSync,source:string,namespace?:string):{objects:number;bytes:number;latest:string|null}{
@@ -264,11 +367,37 @@ export function listSources(db:DatabaseSync):SourceStatus[]{
   result.push(imageLinkSourceStatus(db,'pokemoncard','pokemoncard_images','Pokémon-card.com images (JA)'));
   result.push(imageLinkSourceStatus(db,'pcgsearch','pcgsearch_images','PCG Search images (vintage JA)'));
   result.push(rawOnlySourceStatus(db,'ebay','eBay raw fetch'));
+  const ecbRaw=acquisitionRawStats(db,'ecb'),ecbCount=integer((db.prepare(`SELECT COUNT(*) n FROM exchange_rates WHERE source='ecb'`).get() as Row).n);
+  result.push({source:'ecb',label:'ECB reference rates',latestObservation:ecbRaw.latest,sourceRecords:ecbCount,matchedRecords:ecbCount,
+    unresolvedRecords:0,rawObjects:ecbRaw.objects,rawBytes:ecbRaw.bytes,openReviews:0,status:ecbCount?'ready':ecbRaw.objects?'partial':'empty'});
   return result;
 }
 export function getFacets(db:DatabaseSync):FacetsData{
   const values=(sql:string)=> (db.prepare(sql).all() as unknown as Array<{value:string}>).map((row)=>row.value).filter(Boolean);
   return {languages:values(`SELECT DISTINCT language value FROM sets ORDER BY value`),sets:(db.prepare(`SELECT source_set_id id,name,language FROM sets ORDER BY language,name COLLATE NOCASE`).all() as unknown as Array<{id:string;name:string;language:string}>),categories:values(`SELECT DISTINCT category value FROM cards WHERE category IS NOT NULL ORDER BY value`),rarities:values(`SELECT DISTINCT rarity value FROM cards WHERE rarity IS NOT NULL ORDER BY value`),finishes:values(`SELECT DISTINCT finish value FROM variants WHERE finish IS NOT NULL ORDER BY value`),printRunMarkers:values(`SELECT DISTINCT print_run_marker value FROM variants WHERE print_run_marker IS NOT NULL ORDER BY value`),microVariants:values(`SELECT DISTINCT micro_variant value FROM variants WHERE micro_variant IS NOT NULL ORDER BY value`)};
 }
-export function listMatchReviews(db:DatabaseSync):MatchReviewItem[]{return (db.prepare(`SELECT mr.match_review_id,mr.issue_key,sr.source,sr.namespace,sr.source_key,mr.reason,mr.created_at FROM match_reviews mr JOIN source_records sr ON sr.source_record_id=mr.source_record_id WHERE mr.status='open' ORDER BY mr.created_at DESC LIMIT 200`).all() as unknown as Row[]).map((row)=>({matchReviewId:integer(row.match_review_id),issueKey:text(row.issue_key),source:String(row.source),namespace:String(row.namespace),sourceKey:String(row.source_key),reason:String(row.reason),createdAt:String(row.created_at)}))}
+/**
+ * The open review queue. eBay rows carry the listing title and the matcher's
+ * own working -- extracted numbers, set text, language, and the ranked
+ * candidates with the per-feature reasons each one scored on -- because a
+ * reviewer deciding between two same-numbered cards needs to see what the
+ * matcher saw, not just that it gave up.
+ */
+export function listMatchReviews(db:DatabaseSync):MatchReviewItem[]{
+  return (db.prepare(`SELECT mr.match_review_id,mr.issue_key,sr.source,sr.namespace,sr.source_key,mr.reason,mr.created_at,
+      el.title,el.match_tier,el.score,el.runner_up_score,el.signals_json
+    FROM match_reviews mr
+    JOIN source_records sr ON sr.source_record_id=mr.source_record_id
+    LEFT JOIN ebay_listings el ON el.source_record_id=mr.source_record_id
+    WHERE mr.status='open' ORDER BY mr.created_at DESC LIMIT 200`).all() as unknown as Row[]).map((row)=>{
+    let signals:Record<string,unknown>|null=null;
+    try{ signals=row.signals_json?JSON.parse(String(row.signals_json)) as Record<string,unknown>:null; }catch{ signals=null; }
+    const candidates=Array.isArray(signals?.candidates)?signals.candidates as MatchReviewItem['candidates']:[];
+    return{matchReviewId:integer(row.match_review_id),issueKey:text(row.issue_key),source:String(row.source),
+      namespace:String(row.namespace),sourceKey:String(row.source_key),reason:String(row.reason),createdAt:String(row.created_at),
+      title:text(row.title),matchTier:text(row.match_tier),
+      score:row.score==null?null:Number(row.score),runnerUpScore:row.runner_up_score==null?null:Number(row.runner_up_score),
+      candidates,signals};
+  });
+}
 export function getHealth(db:DatabaseSync):HealthData{const c=db.prepare(`SELECT (SELECT COUNT(*) FROM sets)sets,(SELECT COUNT(*) FROM cards)cards,(SELECT COUNT(*) FROM variants)variants,(SELECT COUNT(*) FROM psa_specs)specs,(SELECT COUNT(*) FROM psa_sales)sales`).get() as Row;const last=db.prepare(`SELECT MAX(executed_at)at FROM parser_executions WHERE parser_name='curated-materializer'`).get() as Row;const version=db.prepare(`PRAGMA user_version`).get() as Row;return{database:'ok',schemaVersion:integer(version.user_version),catalogue:{sets:integer(c.sets),cards:integer(c.cards),variants:integer(c.variants)},psa:{specs:integer(c.specs),sales:integer(c.sales)},lastMaterialization:text(last.at)}}

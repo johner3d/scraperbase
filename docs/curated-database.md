@@ -18,6 +18,10 @@ Use `--no-tcgdex` or `--no-psa` when rebuilding only one source. The PSA
 materializer reads `data/psa-raw`; `data/psa-raw-test` is intentionally not
 part of production materialization.
 
+eBay listings are matched to card variants by `src/curated/ebay/` during the
+same `materialize` pass; `npm run cli -- ebay-match-report` explains what it
+decided and what to fix next. See [`docs/ebay-matching.md`](./ebay-matching.md).
+
 The application should read `v_card_search`, `v_variant_search`, and
 `v_variant_detail`. Raw payloads are available through `source_records`,
 `source_links`, and their observation/object-store references. Unresolved PSA

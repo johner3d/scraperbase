@@ -1,5 +1,5 @@
 import type { Collector, CollectorOutcome } from '../../../core/queue/runner.ts';
-import type { EnqueueSpec } from '../../../core/queue/workItem.ts';
+import { workItemId, type EnqueueSpec } from '../../../core/queue/workItem.ts';
 import { classifyHttpStatus, fetchRaw } from '../../../core/http/fetchClient.ts';
 import type { RateLimiter } from '../../../core/http/rateLimiter.ts';
 import { getEbayAccessToken } from '../auth.ts';
@@ -10,7 +10,7 @@ import {
   EBAY_SEARCH_URL,
   type EbayMarketplaceKey,
 } from '../config.ts';
-import { itemScopeKey, searchPageScopeKey } from '../scopeKeys.ts';
+import { itemScopeKey, liveAuctionAsOfTag, searchPageScopeKey, type EbaySearchMode } from '../scopeKeys.ts';
 
 export interface SearchParams {
   marketplace: EbayMarketplaceKey;
@@ -18,20 +18,71 @@ export interface SearchParams {
   offset: number;
   limit: number;
   maxItems: number;
+  /**
+   * 'all' (default): the original raw-first "capture everything" search --
+   * every buying option, no bid/end-date filtering.
+   * 'live_auctions': --live-auctions sweep -- server-side filtered to
+   * AUCTION listings only, sorted soonest-ending-first, and further
+   * narrowed client-side (see createEbaySearchCollector) to items with at
+   * least `minBidCount` bids whose end date falls before `endingBeforeAt`.
+   * Pagination stops as soon as a page's items run past that cutoff, since
+   * "soonest ending first" means every later item/page would too.
+   */
+  mode?: EbaySearchMode;
+  minBidCount?: number;
+  endingBeforeAt?: string;
 }
 
 export interface SearchDeps {
   rateLimiter: RateLimiter;
 }
 
-interface ItemSummaryBrief {
+export interface ItemSummaryBrief {
   itemId: string;
+  bidCount?: number;
+  itemEndDate?: string;
 }
 
 interface SearchResponseBody {
   total?: number;
   next?: string;
   itemSummaries?: ItemSummaryBrief[];
+}
+
+export interface LiveAuctionSelection {
+  /** itemIds that qualify for an item-detail fetch, in page order. */
+  itemIds: string[];
+  /**
+   * True once this page's soonest-ending-first order crossed
+   * `endingBeforeAt` -- signals the caller to stop paginating, since every
+   * later item (this page's remainder and every subsequent page) would be
+   * past the cutoff too.
+   */
+  pastCutoff: boolean;
+}
+
+/**
+ * Pure filtering for --live-auctions mode: keep only items with at least
+ * `minBidCount` bids whose end date is before `endingBeforeAt`, using only
+ * the bidCount/itemEndDate fields eBay's search response already includes
+ * for free (no item-detail call needed to make this decision). Assumes the
+ * caller requested `sort=endingSoonest`, so the first out-of-window item
+ * ends the scan for the whole page.
+ */
+export function selectLiveAuctionItems(
+  summaries: ItemSummaryBrief[],
+  opts: { minBidCount: number; endingBeforeAt?: string },
+): LiveAuctionSelection {
+  const itemIds: string[] = [];
+  for (const summary of summaries) {
+    if (typeof summary.itemId !== 'string' || summary.itemId.length === 0) continue;
+    if (opts.endingBeforeAt && summary.itemEndDate && summary.itemEndDate >= opts.endingBeforeAt) {
+      return { itemIds, pastCutoff: true };
+    }
+    if ((summary.bidCount ?? 0) < opts.minBidCount) continue;
+    itemIds.push(summary.itemId);
+  }
+  return { itemIds, pastCutoff: false };
 }
 
 export function requestLimit(params: SearchParams): number {
@@ -55,9 +106,11 @@ export function buildSearchUrl(params: SearchParams): string {
     limit: String(requestLimit(params)),
     offset: String(params.offset),
   });
-  const filters = [`buyingOptions:{${EBAY_ALL_BUYING_OPTIONS.join('|')}}`];
+  const liveAuctions = params.mode === 'live_auctions';
+  const filters = [`buyingOptions:{${liveAuctions ? 'AUCTION' : EBAY_ALL_BUYING_OPTIONS.join('|')}}`];
   if (def.itemLocationCountries?.length) filters.push(`itemLocationCountry:{${def.itemLocationCountries.join('|')}}`);
   qs.set('filter', filters.join(','));
+  if (liveAuctions) qs.set('sort', 'endingSoonest');
   return `${EBAY_SEARCH_URL}?${qs.toString()}`;
 }
 
@@ -67,7 +120,7 @@ export function buildSearchUrl(params: SearchParams): string {
  * (while under the configured cap) enqueues the next page.
  */
 export function createEbaySearchCollector(deps: SearchDeps): Collector {
-  return async (_db, item) => {
+  return async (db, item) => {
     const params = JSON.parse(item.params_json) as SearchParams;
     const def = EBAY_MARKETPLACES[params.marketplace];
     const url = buildSearchUrl(params);
@@ -136,27 +189,43 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
       };
     }
 
-    const enqueueNext: EnqueueSpec[] = [];
-    for (const summary of parsed.itemSummaries ?? []) {
-      if (typeof summary.itemId !== 'string' || summary.itemId.length === 0) continue;
-      enqueueNext.push({
-        source: 'ebay',
-        queue: 'ebay_item_detail',
-        entityType: 'item',
-        scopeKey: itemScopeKey(params.marketplace, summary.itemId),
-        params: { marketplace: params.marketplace, itemId: summary.itemId },
-      });
+    const liveAuctions = params.mode === 'live_auctions';
+    const selection = liveAuctions
+      ? selectLiveAuctionItems(parsed.itemSummaries ?? [], { minBidCount: params.minBidCount ?? 0, endingBeforeAt: params.endingBeforeAt })
+      : { itemIds: (parsed.itemSummaries ?? []).map((s) => s.itemId).filter((id): id is string => typeof id === 'string' && id.length > 0), pastCutoff: false };
+    const pastCutoff = selection.pastCutoff;
+
+    // A live sweep is a snapshot refresh, not discovery-only. Re-arm detail
+    // work that succeeded in an older sweep so bids/end state can change and
+    // produce another append-only price observation. New IDs are still
+    // inserted normally by enqueueNext below.
+    if (liveAuctions) {
+      const now = new Date().toISOString();
+      const reset = db.prepare(`UPDATE work_items SET state='pending',attempts=0,available_at=?,last_error=NULL,
+        lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE work_item_id=? AND state='succeeded'`);
+      for (const itemId of selection.itemIds) reset.run(now, now, workItemId('ebay','ebay_item_detail',itemScopeKey(params.marketplace,itemId)));
     }
+
+    const enqueueNext: EnqueueSpec[] = selection.itemIds.map((itemId) => ({
+      source: 'ebay',
+      queue: 'ebay_item_detail',
+      entityType: 'item',
+      scopeKey: itemScopeKey(params.marketplace, itemId),
+      params: { marketplace: params.marketplace, itemId },
+    }));
 
     const apiNextOffset = nextOffset(parsed);
     const total = parsed.total ?? 0;
     const underConfiguredCap = params.maxItems === 0 || (apiNextOffset !== undefined && apiNextOffset < params.maxItems);
-    if (apiNextOffset !== undefined && underConfiguredCap) {
+    if (apiNextOffset !== undefined && underConfiguredCap && !pastCutoff) {
       enqueueNext.push({
         source: 'ebay',
         queue: 'ebay_search',
         entityType: 'search_page',
-        scopeKey: searchPageScopeKey(params.marketplace, params.query, apiNextOffset, params.limit, params.maxItems),
+        scopeKey: searchPageScopeKey(
+          params.marketplace, params.query, apiNextOffset, params.limit, params.maxItems, params.mode,
+          params.endingBeforeAt ? liveAuctionAsOfTag(params.endingBeforeAt) : undefined,
+        ),
         params: { ...params, offset: apiNextOffset },
       });
     }

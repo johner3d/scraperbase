@@ -5,16 +5,15 @@ import type { DatabaseSync } from 'node:sqlite';
 import { DATA_DIR } from '../core/config/config.ts';
 import { readObject, type ObjectStoreDirs } from '../core/objectstore/store.ts';
 import { EBAY_RAW_DIRS } from '../sources/ebay/config.ts';
-import {
-  extractGrading, extractCardIdentity, findCandidateVariants, isLot, isPsa10,
-  type CardIdentity, type EbayItemDetail, type GradingInfo, type VariantCandidate,
-} from './ebayMatch.ts';
+import { createEbayMatcher, isPsa10, type EbayItemDetail, type EbayMatchResult, type EbayMatcher, type GradingInfo } from './ebay/index.ts';
 import { matchPsaCardRow, type PsaSetItemRow } from './psaCardMatch.ts';
 import { autoMatchAllHeadings } from './psaSetMatch.ts';
 import { popSetItemsScopeKey } from '../sources/psa/scopeKeys.ts';
+import { extractSpecId } from '../sources/psa/collectors/cert.ts';
+import { parseEcbUsdRate } from '../sources/ecb/parse.ts';
 
 export const CURATED_PARSER_NAME = 'curated-materializer';
-export const CURATED_PARSER_VERSION = '6';
+export const CURATED_PARSER_VERSION = '7';
 
 export interface MaterializeOptions {
   psaDir?: string;
@@ -23,6 +22,7 @@ export interface MaterializeOptions {
   includeTcgdex?: boolean;
   includePsa?: boolean;
   includeEbay?: boolean;
+  includeEcb?: boolean;
   now?: string;
 }
 
@@ -42,6 +42,7 @@ export interface MaterializeResult {
   ebayListings: number;
   matchedEbayListings: number;
   ebayPriceObservations: number;
+  exchangeRates: number;
   openReviews: number;
 }
 
@@ -226,6 +227,10 @@ function latestObservations(db: DatabaseSync, entityType: string): ObservationRo
 }
 async function readObservationJson<T>(row: ObservationRow, dirs?: ObjectStoreDirs): Promise<T> {
   return JSON.parse((await readObject(row.storage_path, dirs)).toString('utf8')) as T;
+}
+/** Raw text of a stored observation, for responses that are not JSON (PSA serves cert lookups as HTML). */
+async function readObservationText(row: ObservationRow, dirs?: ObjectStoreDirs): Promise<string | null> {
+  try { return (await readObject(row.storage_path, dirs)).toString('utf8'); } catch { return null; }
 }
 
 function upsertSourceRecord(db: DatabaseSync, args: {
@@ -634,7 +639,7 @@ function upsertSales(db:DatabaseSync,data:SalesFile,specPk:number,observation:Ob
   }
   return count;
 }
-async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omit<MaterializeResult,'sets'|'cards'|'hydratedCards'|'variants'|'assets'|'localAssetsLinked'|'openReviews'|'ebayListings'|'matchedEbayListings'|'ebayPriceObservations'>>{
+async function materializePsa(db:DatabaseSync,root:string,at:string):Promise<Omit<MaterializeResult,'sets'|'cards'|'hydratedCards'|'variants'|'assets'|'localAssetsLinked'|'openReviews'|'ebayListings'|'matchedEbayListings'|'ebayPriceObservations'|'exchangeRates'>>{
   const populations=latestFiles<PopulationFile>(root,'population',(data)=>String(data.psaSpecId));
   const sales=latestFiles<SalesFile>(root,'sales',(data)=>String(data.salesSpecId));
   db.prepare(`DELETE FROM match_reviews WHERE source_record_id IN (SELECT source_record_id FROM source_records WHERE source='psa') AND status='open'`).run();
@@ -762,107 +767,261 @@ async function materializePsaNative(db:DatabaseSync,at:string,dirs?:ObjectStoreD
   return{psaSpecs,populationRows,matchedPsaSpecs};
 }
 
-function ebayPriceFingerprint(args:{priceValue:number|null;priceCurrency:string|null;buyingOptions:string[];currentBidPrice:number|null;bidCount:number|null;itemEndDate:string|null}):string{
-  return createHash('sha256').update([args.priceValue??'',args.priceCurrency??'',args.buyingOptions.join(','),args.currentBidPrice??'',args.bidCount??'',args.itemEndDate??''].join('|')).digest('hex');
+function ebayPriceFingerprint(args:{priceValue:number|null;priceCurrency:string|null;buyingOptions:string[];currentBidPrice:number|null;minimumBidPrice:number|null;bidCount:number|null;itemEndDate:string|null}):string{
+  const values:unknown[]=[args.priceValue??'',args.priceCurrency??'',args.buyingOptions.join(','),args.currentBidPrice??''];
+  // Preserve every pre-v9 fingerprint when the newly curated field is absent;
+  // otherwise a schema upgrade would manufacture a duplicate observation for
+  // every listing even though eBay returned no changed auction state.
+  if(args.minimumBidPrice!=null)values.push(args.minimumBidPrice);
+  values.push(args.bidCount??'',args.itemEndDate??'');
+  return createHash('sha256').update(values.join('|')).digest('hex');
 }
 function insertEbayPriceObservation(db:DatabaseSync,listingId:number,item:EbayItemDetail,observation:ObservationRow|null,at:string):boolean{
   const priceValue=item.price?.value!=null?Number(item.price.value):null;
   const priceCurrency=item.price?.currency??null;
   const buyingOptions=item.buyingOptions??[];
   const currentBidPrice=item.currentBidPrice?.value!=null?Number(item.currentBidPrice.value):null;
+  const minimumBidPrice=item.minimumPriceToBid?.value!=null?Number(item.minimumPriceToBid.value):null;
   const bidCount=item.bidCount??null;
   const itemEndDate=item.itemEndDate??null;
-  const fp=ebayPriceFingerprint({priceValue,priceCurrency,buyingOptions,currentBidPrice,bidCount,itemEndDate});
+  const fp=ebayPriceFingerprint({priceValue,priceCurrency,buyingOptions,currentBidPrice,minimumBidPrice,bidCount,itemEndDate});
   const result=db.prepare(`INSERT OR IGNORE INTO ebay_listing_price_observations
-    (ebay_listing_id,observation_id,observed_at,price_value,price_currency,buying_options_json,current_bid_price,bid_count,item_end_date,snapshot_fingerprint)
-    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(listingId,observation?.observation_id??null,at,priceValue,priceCurrency,json(buyingOptions),currentBidPrice,bidCount,itemEndDate,fp);
+    (ebay_listing_id,observation_id,observed_at,price_value,price_currency,buying_options_json,current_bid_price,bid_count,item_end_date,snapshot_fingerprint,minimum_bid_price)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(listingId,observation?.observation_id??null,observation?.observed_at??at,priceValue,priceCurrency,json(buyingOptions),currentBidPrice,bidCount,itemEndDate,fp,minimumBidPrice);
   return result.changes>0;
 }
-function recordEbayReview(db:DatabaseSync,sourceRecordId:number,at:string,reason:string,candidates:VariantCandidate[]):void{
+function recordEbayReview(db:DatabaseSync,sourceRecordId:number,at:string,result:EbayMatchResult):void{
   const exists=db.prepare(`SELECT 1 FROM match_reviews WHERE source_record_id=? AND target_type='variant' AND status='open'`).get(sourceRecordId);
   if(exists) return;
   db.prepare(`INSERT INTO match_reviews(source_record_id,target_type,candidate_target_id,reason,candidates_json,status,created_at)
-    VALUES(?,'variant',?,?,?,'open',?)`).run(sourceRecordId,candidates[0]?.variantId??null,reason,json(candidates.map((c)=>c.variantId)),at);
+    VALUES(?,'variant',?,?,?,'open',?)`).run(sourceRecordId,result.decision.candidateCardIds[0]??null,
+      result.decision.reason??'Unresolved eBay listing',json(result.decision.candidateCardIds),at);
 }
-function resolveEbayVariant(db:DatabaseSync,sourceRecordId:number,identity:CardIdentity,at:string):{variantId:number|null;status:'matched'|'ambiguous'|'unmatched'|'manual';method:string;confidence:number|null}{
-  const override=db.prepare(`SELECT target_id FROM match_overrides WHERE source_record_id=? AND target_type='variant' AND active=1`).get(sourceRecordId) as {target_id:number}|undefined;
-  if(override){
-    linkSource(db,sourceRecordId,'variant',override.target_id,'manual','manual-match-override',at);
-    return{variantId:override.target_id,status:'manual',method:'manual-match-override',confidence:1};
-  }
-  const method=identity.confidence==='aspects'?'ebay-aspect-match':'ebay-title-fallback-match';
-  const confidence=identity.confidence==='aspects'?0.8:0.4;
-  const{candidates,corroborated}=findCandidateVariants(db,identity);
-  // A card number alone repeats constantly across a ~56k-card, multi-language,
-  // multi-set catalogue -- a single hit with no corroborating name match is a
-  // coincidence, not proof, so it goes to review rather than auto-matching.
-  if(candidates.length===1&&corroborated){
-    linkSource(db,sourceRecordId,'variant',candidates[0]!.variantId,'matched',method,at,confidence);
-    return{variantId:candidates[0]!.variantId,status:'matched',method,confidence};
-  }
-  if(candidates.length>=1){
-    recordEbayReview(db,sourceRecordId,at,candidates.length>1
-      ?'Multiple candidate variants matched this eBay listing'
-      :'Card number matched one variant, but with no corroborating card-name match',candidates);
-    return{variantId:null,status:'ambiguous',method,confidence};
-  }
-  recordEbayReview(db,sourceRecordId,at,'No candidate variant found for this eBay listing',[]);
-  return{variantId:null,status:'unmatched',method,confidence:null};
-}
+
+/**
+ * Only genuinely reviewable outcomes are queued. Out-of-scope listings (other
+ * TCGs, non-card merchandise), multi-card lots and catalogue gaps -- where the
+ * set is identified but its cards were never ingested -- are recorded on the
+ * listing row and surfaced by `ebay-match-report` instead, because there is no
+ * decision a human could make about them.
+ */
+function isReviewable(result:EbayMatchResult):boolean{return result.decision.tier==='review'}
+
 function upsertEbayListing(db:DatabaseSync,args:{
   sourceRecordId:number;marketplace:string;itemId:string;legacyItemId:string|null;itemWebUrl:string|null;title:string;
-  grading:GradingInfo;identity:CardIdentity;isLot:boolean;variantId:number|null;
-  matchStatus:'matched'|'unmatched'|'ambiguous'|'manual';matchMethod:string|null;confidence:number|null;
-  at:string;observation:ObservationRow|null;
+  grading:GradingInfo;result:EbayMatchResult;item:EbayItemDetail;at:string;observation:ObservationRow|null;
 }):number{
+  const{decision,evidence,signals}=args.result;
+  const shipping=[...(args.item.shippingOptions??[])].filter((option)=>option.shippingCost?.value!=null)
+    .sort((a,b)=>Number(a.shippingCost!.value)-Number(b.shippingCost!.value))[0];
+  const location=[args.item.itemLocation?.city,args.item.itemLocation?.country].filter(Boolean).join(', ')||null;
+  // The seller's own words only. Falling back to the resolver's answer here
+  // would make `ebay-match-report`'s "set names no alias resolves" list quote
+  // the catalogue back at itself instead of naming the text worth curating.
+  const setText=evidence.setTexts[0]??null;
   return (db.prepare(`INSERT INTO ebay_listings
     (source_record_id,marketplace,item_id,legacy_item_id,item_web_url,title,grader,grade_label,grade_value,cert_number,
-     extracted_card_name,extracted_card_number,extracted_set_name,extracted_language,is_lot,variant_id,match_status,match_method,confidence,
-     first_seen_at,last_seen_at,latest_observation_id)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     extracted_card_name,extracted_card_number,extracted_set_name,extracted_language,is_lot,card_id,variant_id,match_status,match_method,confidence,
+     match_tier,flagged,score,runner_up_score,variant_confidence,signals_json,first_seen_at,last_seen_at,latest_observation_id,
+     subtitle,primary_image_url,condition_label,seller_username,seller_feedback_score,seller_feedback_percent,item_location_country,
+     item_location_text,shipping_cost_value,shipping_cost_currency,shipping_service,returns_accepted)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(source_record_id) DO UPDATE SET
       title=excluded.title,grader=excluded.grader,grade_label=excluded.grade_label,grade_value=excluded.grade_value,cert_number=excluded.cert_number,
       extracted_card_name=excluded.extracted_card_name,extracted_card_number=excluded.extracted_card_number,extracted_set_name=excluded.extracted_set_name,
-      extracted_language=excluded.extracted_language,is_lot=excluded.is_lot,variant_id=excluded.variant_id,match_status=excluded.match_status,
-      match_method=excluded.match_method,confidence=excluded.confidence,last_seen_at=excluded.last_seen_at,latest_observation_id=excluded.latest_observation_id
+      extracted_language=excluded.extracted_language,is_lot=excluded.is_lot,card_id=excluded.card_id,variant_id=excluded.variant_id,
+      match_status=excluded.match_status,match_method=excluded.match_method,confidence=excluded.confidence,match_tier=excluded.match_tier,
+      flagged=excluded.flagged,score=excluded.score,runner_up_score=excluded.runner_up_score,variant_confidence=excluded.variant_confidence,
+      signals_json=excluded.signals_json,last_seen_at=excluded.last_seen_at,latest_observation_id=excluded.latest_observation_id,
+      subtitle=excluded.subtitle,primary_image_url=excluded.primary_image_url,condition_label=excluded.condition_label,
+      seller_username=excluded.seller_username,seller_feedback_score=excluded.seller_feedback_score,seller_feedback_percent=excluded.seller_feedback_percent,
+      item_location_country=excluded.item_location_country,item_location_text=excluded.item_location_text,
+      shipping_cost_value=excluded.shipping_cost_value,shipping_cost_currency=excluded.shipping_cost_currency,
+      shipping_service=excluded.shipping_service,returns_accepted=excluded.returns_accepted
     RETURNING ebay_listing_id`).get(
       args.sourceRecordId,args.marketplace,args.itemId,args.legacyItemId,args.itemWebUrl,args.title,
       args.grading.grader,args.grading.gradeLabel,args.grading.gradeValue,args.grading.certNumber,
-      args.identity.cardName,args.identity.cardNumber,args.identity.setName,args.identity.language,
-      args.isLot?1:0,args.variantId,args.matchStatus,args.matchMethod,args.confidence,
-      args.at,args.at,args.observation?.observation_id??null) as {ebay_listing_id:number}).ebay_listing_id;
+      evidence.names[0]??null,evidence.numbers[0]?.value??null,setText,evidence.language,
+      evidence.isLot?1:0,decision.cardId,decision.variantId,decision.matchStatus,decision.method,decision.confidence,
+      decision.tier,decision.flagged?1:0,decision.score,decision.runnerUpScore,decision.variantConfidence,json(signals),
+      args.at,args.at,args.observation?.observation_id??null,
+      nullableText(args.item.subtitle),nullableText(args.item.image?.imageUrl),nullableText(args.item.condition),nullableText(args.item.seller?.username),
+      args.item.seller?.feedbackScore??null,args.item.seller?.feedbackPercentage!=null?Number(args.item.seller.feedbackPercentage):null,
+      nullableText(args.item.itemLocation?.country),location,shipping?.shippingCost?.value!=null?Number(shipping.shippingCost.value):null,
+      nullableText(shipping?.shippingCost?.currency),nullableText(shipping?.shippingServiceCode??shipping?.type),
+      args.item.returnTerms?.returnsAccepted==null?null:(args.item.returnTerms.returnsAccepted?1:0)) as {ebay_listing_id:number}).ebay_listing_id;
 }
-async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs):Promise<{listings:number;matchedListings:number;priceObservations:number}>{
+
+/**
+ * A manual resolution is authoritative and also teaches the set alias table:
+ * eBay set text is written the same way by every seller copying the same slab
+ * label, so one human decision usually clears a whole family of listings on
+ * the next run.
+ */
+function learnSetAlias(db:DatabaseSync,result:EbayMatchResult,cardId:number,at:string):void{
+  if(!result.evidence.setTexts.length) return;
+  const row=db.prepare(`SELECT s.source_set_id,s.language FROM cards c JOIN sets s ON s.set_id=c.set_id WHERE c.card_id=?`)
+    .get(cardId) as {source_set_id:string;language:string}|undefined;
+  if(!row) return;
+  for(const text of result.evidence.setTexts){
+    const alias=normalizePart(text);
+    if(!alias) continue;
+    db.prepare(`INSERT OR IGNORE INTO ebay_set_aliases(alias_text,language,source_set_id,origin,created_at) VALUES(?,?,?,'learned',?)`)
+      .run(alias,row.language,row.source_set_id,at);
+  }
+}
+
+function applyEbayOverride(db:DatabaseSync,sourceRecordId:number,result:EbayMatchResult,at:string):boolean{
+  const override=db.prepare(`SELECT target_id FROM match_overrides WHERE source_record_id=? AND target_type='variant' AND active=1`)
+    .get(sourceRecordId) as {target_id:number}|undefined;
+  if(!override) return false;
+  const card=db.prepare('SELECT card_id FROM variants WHERE variant_id=?').get(override.target_id) as {card_id:number}|undefined;
+  linkSource(db,sourceRecordId,'variant',override.target_id,'manual','manual-match-override',at);
+  if(card) learnSetAlias(db,result,card.card_id,at);
+  Object.assign(result.decision,{
+    cardId:card?.card_id??null,variantId:override.target_id,matchStatus:'manual' as const,tier:'exact' as const,
+    method:'manual-match-override',confidence:1,score:result.decision.score,flagged:false,variantConfidence:'proven' as const,
+  });
+  return true;
+}
+
+/**
+ * Listings are heavily duplicated: one seller relists the same card with a
+ * template title, and several sellers copy the same PSA label text. Once any
+ * listing in a title cluster has been matched, siblings that only failed on a
+ * missing signal inherit the answer instead of being reviewed one at a time.
+ * Inherited matches are always flagged -- they are an inference about a
+ * different listing, not evidence from this one.
+ */
+function propagateEbayClusters(db:DatabaseSync,at:string):number{
+  const rows=db.prepare(`SELECT ebay_listing_id,source_record_id,title,card_id,variant_id,match_tier,score FROM ebay_listings`).all() as unknown as
+    Array<{ebay_listing_id:number;source_record_id:number;title:string;card_id:number|null;variant_id:number|null;match_tier:string|null;score:number|null}>;
+  const clusters=new Map<string,Array<typeof rows[number]>>();
+  for(const row of rows){
+    // Seller templates differ only by a trailing serial ("... #70ee") and by
+    // stray numbers, so the cluster key drops both.
+    const key=normalizePart(row.title).replace(/_[0-9a-f]{4,}$/,'').replace(/_\d+/g,'');
+    if(key.length<12) continue;
+    const list=clusters.get(key); if(list) list.push(row); else clusters.set(key,[row]);
+  }
+  let propagated=0;
+  for(const list of clusters.values()){
+    if(list.length<2) continue;
+    const best=list.filter((row)=>row.card_id!=null).sort((a,b)=>(b.score??0)-(a.score??0))[0];
+    if(!best) continue;
+    for(const row of list){
+      if(row.card_id!=null||row.match_tier!=='review') continue;
+      db.prepare(`UPDATE ebay_listings SET card_id=?,variant_id=?,match_status='matched',match_method='ebay-cluster-propagate',
+        match_tier='flagged',flagged=1,confidence=?,last_seen_at=? WHERE ebay_listing_id=?`)
+        .run(best.card_id,best.variant_id,Math.min(1,best.score??0.5),at,row.ebay_listing_id);
+      // The queue entry is withdrawn rather than marked resolved: nobody
+      // reviewed it, and `match_reviews` is unique per record+type+status, so a
+      // record that was already resolved once cannot take a second resolved row.
+      db.prepare(`DELETE FROM match_reviews WHERE source_record_id=? AND status='open'`).run(row.source_record_id);
+      if(best.variant_id!=null) linkSource(db,row.source_record_id,'variant',best.variant_id,'matched','ebay-cluster-propagate',at,0.5);
+      propagated++;
+    }
+  }
+  return propagated;
+}
+
+interface CertMatch { variantId:number; cardId:number }
+
+/**
+ * Certification number -> the variant PSA graded, built from stored PSA cert
+ * lookups (see src/sources/psa/collectors/cert.ts).
+ *
+ * This is the one exact identification available for an eBay listing. Nothing
+ * else establishes the finish or the 1st-edition status of a slabbed card:
+ * listing titles say "holo" when they mean reverse holo, and item specifics
+ * say nothing at all. Certs that PSA has no spec for, or whose spec is not
+ * mapped to a catalogue variant yet, are simply absent from the map -- those
+ * listings fall through to the scored matcher exactly as before.
+ */
+async function buildCertVariantMap(db:DatabaseSync,dirs:ObjectStoreDirs):Promise<Map<string,CertMatch>> {
+  const map=new Map<string,CertMatch>();
+  const rows=latestObservations(db,'cert');
+  if(!rows.length) return map;
+  const specToVariant=new Map<string,CertMatch>();
+  for(const row of db.prepare(`SELECT ps.spec_id, ps.variant_id, v.card_id FROM psa_specs ps
+    JOIN variants v ON v.variant_id = ps.variant_id WHERE ps.variant_id IS NOT NULL`).all() as unknown as
+    Array<{spec_id:string;variant_id:number;card_id:number}>){
+    specToVariant.set(row.spec_id,{variantId:row.variant_id,cardId:row.card_id});
+  }
+  for(const row of rows){
+    const cert=/^cert:(.+)$/.exec(row.scope_key)?.[1]; if(!cert) continue;
+    const html=await readObservationText(row,dirs); if(html==null) continue;
+    const specId=extractSpecId(html); if(!specId) continue;
+    const found=specToVariant.get(specId); if(found) map.set(cert,found);
+  }
+  return map;
+}
+
+async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs):Promise<{listings:number;matchedListings:number;priceObservations:number;propagated:number}>{
   const rows=latestObservations(db,'item');
+  // The queue is rebuilt from scratch on every run, exactly as the PSA path
+  // does: a listing that a better matcher, a new alias or newly ingested cards
+  // have since resolved must not leave a stale row asking a human to look at
+  // it. Resolved rows are history and are kept.
+  db.prepare(`DELETE FROM match_reviews WHERE status='open' AND source_record_id IN
+    (SELECT source_record_id FROM source_records WHERE source='ebay')`).run();
+  const matcher:EbayMatcher=createEbayMatcher(db);
+  const certVariants=await buildCertVariantMap(db,dirs);
   let listings=0,matchedListings=0,priceObservations=0;
   for(const row of rows){
     const match=/^item:([^:]+):(.+)$/.exec(row.scope_key); if(!match) continue;
     const marketplace=match[1]!,itemId=match[2]!;
     const item=await readObservationJson<EbayItemDetail>(row,dirs);
     const record=upsertSourceRecord(db,{source:'ebay',namespace:marketplace,sourceKey:itemId,entityType:'item',language:null,observation:row,observedAt:row.observed_at});
-    const grading=extractGrading(item);
-    if(!isPsa10(grading)){recordParser(db,row,at,{kind:'ebay-item',skipped:'not-psa-10'});continue;}
-    const lot=isLot(item);
-    const identity=extractCardIdentity(item);
-    const resolved=lot
-      ?{variantId:null,status:'unmatched' as const,method:'ebay-lot-excluded',confidence:null}
-      :resolveEbayVariant(db,record,identity,at);
+    const result=matcher.match(item);
+    if(!isPsa10(result.evidence.grading)){recordParser(db,row,at,{kind:'ebay-item',skipped:'not-psa-10'});continue;}
+    // An exact identification from the slab's own certification number
+    // outranks anything inferred from the listing text.
+    const cert=result.evidence.grading.certNumber?.trim();
+    const certMatch=cert?certVariants.get(cert):undefined;
+    if(certMatch){
+      Object.assign(result.decision,{
+        cardId:certMatch.cardId,variantId:certMatch.variantId,tier:'exact' as const,matchStatus:'matched' as const,
+        method:'ebay-psa-cert',confidence:1,flagged:false,variantConfidence:'proven' as const,gapSubject:null,
+      });
+    }
+    if(!applyEbayOverride(db,record,result,at)){
+      if(result.decision.variantId!=null) linkSource(db,record,'variant',result.decision.variantId,result.decision.matchStatus,result.decision.method,at,result.decision.confidence);
+      else if(result.decision.cardId!=null) linkSource(db,record,'card',result.decision.cardId,result.decision.matchStatus,result.decision.method,at,result.decision.confidence);
+    }
     const listingId=upsertEbayListing(db,{
       sourceRecordId:record,marketplace,itemId,legacyItemId:nullableText(item.legacyItemId),itemWebUrl:nullableText(item.itemWebUrl),
-      title:valueText(item.title,itemId),grading,identity,isLot:lot,variantId:resolved.variantId,matchStatus:resolved.status,
-      matchMethod:resolved.method,confidence:resolved.confidence,at,observation:row,
+      title:valueText(item.title,itemId),grading:result.evidence.grading,result,item,at,observation:row,
     });
+    if(isReviewable(result)) recordEbayReview(db,record,at,result);
     listings++;
-    if(resolved.status==='matched'||resolved.status==='manual') matchedListings++;
+    if(result.decision.cardId!=null) matchedListings++;
     if(insertEbayPriceObservation(db,listingId,item,row,at)) priceObservations++;
-    recordParser(db,row,at,{kind:'ebay-item',listingId,matchStatus:resolved.status});
+    recordParser(db,row,at,{kind:'ebay-item',listingId,matchStatus:result.decision.matchStatus,tier:result.decision.tier});
   }
-  return{listings,matchedListings,priceObservations};
+  const propagated=propagateEbayClusters(db,at);
+  return{listings,matchedListings:matchedListings+propagated,priceObservations,propagated};
+}
+
+async function materializeEcb(db:DatabaseSync,at:string,dirs?:ObjectStoreDirs):Promise<number>{
+  const row=latestObservation(db,'fx_rates','daily-reference-rates');
+  if(!row)return 0;
+  const xml=await readObservationText(row,dirs);
+  if(!xml)return 0;
+  const parsed=parseEcbUsdRate(xml);
+  if(!parsed)throw new Error('Latest ECB observation does not contain a dated USD reference rate');
+  const date=parsed.rateDate,rate=parsed.usdPerEur;
+  upsertSourceRecord(db,{source:'ecb',namespace:'reference-rates',sourceKey:date,entityType:'fx_rates',observation:row,observedAt:row.observed_at});
+  const result=db.prepare(`INSERT INTO exchange_rates(source,rate_date,base_currency,quote_currency,rate,observed_at,observation_id)
+    VALUES('ecb',?,'EUR','USD',?,?,?) ON CONFLICT(source,rate_date,base_currency,quote_currency) DO UPDATE SET
+    rate=excluded.rate,observed_at=excluded.observed_at,observation_id=excluded.observation_id`).run(date,rate,row.observed_at,row.observation_id);
+  recordParser(db,row,at,{kind:'ecb-reference-rates',date,usdPerEur:rate});
+  return Number(result.changes);
 }
 
 export async function materialize(db:DatabaseSync,options:MaterializeOptions={}):Promise<MaterializeResult>{
   const at=options.now??new Date().toISOString();
-  const result:MaterializeResult={sets:0,cards:0,hydratedCards:0,variants:0,assets:0,localAssetsLinked:0,psaSpecs:0,populationRows:0,priceRows:0,censusRows:0,salesRows:0,matchedPsaSpecs:0,ebayListings:0,matchedEbayListings:0,ebayPriceObservations:0,openReviews:0};
+  const result:MaterializeResult={sets:0,cards:0,hydratedCards:0,variants:0,assets:0,localAssetsLinked:0,psaSpecs:0,populationRows:0,priceRows:0,censusRows:0,salesRows:0,matchedPsaSpecs:0,ebayListings:0,matchedEbayListings:0,ebayPriceObservations:0,exchangeRates:0,openReviews:0};
   db.exec('BEGIN IMMEDIATE');
   try{
     if(options.includeTcgdex!==false){const tcg=await materializeTcgdex(db,at,options.objectStoreDirs);result.sets=tcg.sets;result.cards=tcg.cards;result.hydratedCards=tcg.hydratedCards;result.variants=tcg.variants;result.assets=tcg.assets;result.localAssetsLinked=tcg.localAssetsLinked;}
@@ -872,6 +1031,7 @@ export async function materialize(db:DatabaseSync,options:MaterializeOptions={})
       result.psaSpecs+=native.psaSpecs;result.populationRows+=native.populationRows;result.matchedPsaSpecs+=native.matchedPsaSpecs;
     }
     if(options.includeEbay!==false){const ebay=await materializeEbay(db,at,options.ebayDirs??EBAY_RAW_DIRS);result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;}
+    if(options.includeEcb!==false)result.exchangeRates=await materializeEcb(db,at,options.objectStoreDirs);
     result.openReviews=Number((db.prepare(`SELECT COUNT(*) n FROM match_reviews WHERE status='open'`).get() as {n:number}).n);
     db.exec('COMMIT');return result;
   }catch(error){db.exec('ROLLBACK');throw error;}

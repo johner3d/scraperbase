@@ -9,7 +9,7 @@ import { normalizePart } from './materialize.ts';
 // auto-accepted, everything else is left for manual resolution via
 // resolvePsaSetMap() rather than guessed.
 
-const STOPWORDS = new Set(['pokemon', 'promo', 'promos', 'tcg', 'card', 'cards', 'the', 'of', 'set']);
+const STOPWORDS = new Set(['pokemon', 'pokémon', 'promo', 'promos', 'tcg', 'card', 'cards', 'the', 'of', 'set', 'amp']);
 
 const LANGUAGE_HINTS: Array<{ pattern: RegExp; language: string }> = [
   { pattern: /\bfrench\b/i, language: 'fr' },
@@ -29,7 +29,9 @@ export function inferHeadingLanguage(headingName: string): string {
 }
 
 function tokenize(name: string): Set<string> {
-  const words = normalizePart(name).split('_').filter(Boolean);
+  // normalizePart turns the decomposed accent in "Pokémon" into
+  // "poke_mon"; fold that common spelling before tokenization.
+  const words = normalizePart(name).replace(/poke_mon/g, 'pokemon').split('_').filter(Boolean);
   return new Set(words.filter((w) => !STOPWORDS.has(w) && !LANGUAGE_HINTS.some((h) => h.pattern.test(w))));
 }
 
@@ -45,6 +47,7 @@ interface TcgdexSetRow {
   source_set_id: string;
   name: string;
   language: string;
+  series: string | null;
 }
 
 const AUTO_MATCH_THRESHOLD = 0.5;
@@ -57,9 +60,20 @@ const AUTO_MATCH_THRESHOLD = 0.5;
 export function scoreCandidates(db: DatabaseSync, headingName: string): Array<{ setId: number; sourceSetId: string; name: string; score: number }> {
   const language = inferHeadingLanguage(headingName);
   const headingTokens = tokenize(headingName);
-  const rows = db.prepare(`SELECT set_id, source_set_id, name, language FROM sets WHERE language = ?`).all(language) as unknown as TcgdexSetRow[];
+  const rows = db.prepare(`SELECT set_id, source_set_id, name, language, series FROM sets WHERE language = ?`).all(language) as unknown as TcgdexSetRow[];
   return rows
-    .map((row) => ({ setId: row.set_id, sourceSetId: row.source_set_id, name: row.name, score: jaccard(headingTokens, tokenize(row.name)) }))
+    .map((row) => {
+      const setTokens = tokenize(row.name);
+      let intersection = 0;
+      for (const token of setTokens) if (headingTokens.has(token)) intersection++;
+      const coverage = setTokens.size === 0 ? 0 : intersection / setTokens.size;
+      // PSA commonly prefixes the actual set with its era, e.g.
+      // "Diamond & Pearl Stormfront". Prefer the specific suffix set over
+      // the generic era set when both are present in the heading.
+      const genericSeriesPenalty = row.series && normalizePart(row.series) === normalizePart(row.name) ? 0.3 : 0;
+      const score = Math.max(0, coverage * 0.65 + jaccard(headingTokens, setTokens) * 0.35 - genericSeriesPenalty);
+      return { setId: row.set_id, sourceSetId: row.source_set_id, name: row.name, score };
+    })
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score);
 }
@@ -87,7 +101,8 @@ export function autoMatchHeading(db: DatabaseSync, psaSetMapId: number, headingN
 
 /** Runs auto-matching over every unresolved heading. Returns counts for reporting. */
 export function autoMatchAllHeadings(db: DatabaseSync, at = new Date().toISOString()): { matched: number; ambiguous: number; unmatched: number } {
-  const rows = db.prepare(`SELECT psa_set_map_id, psa_heading_name FROM psa_set_map WHERE match_status IN ('unmatched', 'ambiguous')`)
+  const rows = db.prepare(`SELECT psa_set_map_id, psa_heading_name FROM psa_set_map
+    WHERE match_status IN ('unmatched', 'ambiguous') OR (match_status='matched' AND match_method='token-overlap')`)
     .all() as unknown as Array<{ psa_set_map_id: number; psa_heading_name: string }>;
   let matched = 0, ambiguous = 0, unmatched = 0;
   for (const row of rows) {

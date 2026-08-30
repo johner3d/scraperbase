@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { openDb } from '../../src/core/db/client.ts';
-import { getCard, getMarket, getPopulation, listCards, listSources, listVariants } from '../../src/web/api.ts';
+import { getAuction, getAuctionFacets, getCard, getMarket, getPopulation, listAuctions, listCards, listSources, listVariants } from '../../src/web/api.ts';
 
 async function fixture() {
   const dir = await mkdtemp(path.join(tmpdir(), 'scraperbase-web-'));
@@ -60,6 +60,22 @@ test('PSA availability is explicit for a variant with no matched PSA source', as
     assert.equal(market.priceGuideAvailable,false);
     assert.equal(market.salesAvailable,false);
     assert.equal(population.available,false);
+  } finally { f.db.close(); await rm(f.dir,{recursive:true,force:true}); }
+});
+
+test('newer empty PSA sales snapshots do not hide an earlier populated sales spec', async () => {
+  const f = await fixture();
+  try {
+    const newer = '2026-08-30T12:00:00.000Z';
+    f.db.prepare(`INSERT INTO psa_specs
+      (namespace,spec_id,variant_id,release,source_card_id,finish,print_run_marker,source_url,match_status,fetched_at,coverage_total_count,coverage_complete)
+      VALUES ('sales','empty-newer',?,'base1','base1-1','Holo','Unlimited','https://psa.test/empty','matched',?,0,1)`)
+      .run(f.variantId,newer);
+    const market = getMarket(f.db,f.variantId);
+    assert.equal(market.sales.length,1);
+    assert.equal(market.sales[0]!.saleItemId,'sale-1');
+    const variants=listVariants(f.db,new URLSearchParams('q=Alakazam'));
+    assert.equal(variants.items[0]!.saleCount,1);
   } finally { f.db.close(); await rm(f.dir,{recursive:true,force:true}); }
 });
 
@@ -121,4 +137,28 @@ test('card sorting is natural, monthly median is exact, and language links requi
     const detail=getCard(f.db,f.cardId)!;
     assert.deepEqual(detail.alsoPrintedIn.map((card)=>card.setName),['Grundset']);
   } finally { f.db.close(); await rm(f.dir,{recursive:true,force:true}); }
+});
+
+test('live auctions enforce trusted scope and calculate dated EUR comparisons', async()=>{
+  const f=await fixture();
+  try{
+    const observed='2026-08-30T09:00:00.000Z',now=new Date(observed);
+    const source=(f.db.prepare(`INSERT INTO source_records(source,namespace,source_key,entity_type,first_seen_at,last_seen_at)
+      VALUES('ebay','de','auction-1','item',?,?) RETURNING source_record_id`).get(observed,observed) as {source_record_id:number}).source_record_id;
+    const listing=(f.db.prepare(`INSERT INTO ebay_listings(source_record_id,marketplace,item_id,item_web_url,title,grader,grade_value,is_lot,
+      card_id,variant_id,match_status,match_tier,flagged,signals_json,first_seen_at,last_seen_at,primary_image_url,shipping_cost_value,shipping_cost_currency)
+      VALUES(?,'de','auction-1','https://www.ebay.test/auction-1','PSA 10 Alakazam Base Set','PSA',10,0,?,?,'matched','strong',0,'{}',?,?,'https://images.test/auction.jpg',5,'EUR') RETURNING ebay_listing_id`)
+      .get(source,f.cardId,f.variantId,observed,observed) as {ebay_listing_id:number}).ebay_listing_id;
+    f.db.prepare(`INSERT INTO ebay_listing_price_observations(ebay_listing_id,observed_at,price_value,price_currency,buying_options_json,
+      current_bid_price,minimum_bid_price,bid_count,item_end_date,snapshot_fingerprint) VALUES(?, ?,400,'EUR','["AUCTION"]',400,410,3,'2026-08-30T10:00:00.000Z','one')`).run(listing,observed);
+    f.db.prepare(`INSERT INTO exchange_rates(source,rate_date,base_currency,quote_currency,rate,observed_at)
+      VALUES('ecb','2026-08-30','EUR','USD',2,?)`).run(observed);
+    const page=listAuctions(f.db,new URLSearchParams('psaPrice=available&discountMin=0'),now);
+    assert.equal(page.total,1);assert.equal(page.summary.ending24Hours,1);assert.equal(page.items[0]!.comparison.psaGuideEur,400);assert.equal(page.items[0]!.comparison.discountPercent,0);
+    assert.equal(page.items[0]!.minimumBid,410);assert.equal(getAuctionFacets(f.db,now).sets[0]!.id,'base1');
+    const ended=getAuction(f.db,listing,new Date('2026-08-30T11:00:00.000Z'));
+    assert.ok(ended);assert.equal(ended.auction.active,false);assert.equal(ended.priceHistory.length,1);
+    f.db.prepare(`UPDATE ebay_listings SET flagged=1,match_tier='flagged' WHERE ebay_listing_id=?`).run(listing);
+    assert.equal(listAuctions(f.db,new URLSearchParams(),now).total,0);
+  }finally{f.db.close();await rm(f.dir,{recursive:true,force:true})}
 });

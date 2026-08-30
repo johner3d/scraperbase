@@ -169,10 +169,10 @@ This provides history with deduplication:
 - failures are auditable because their response bodies and attempt metadata
   are retained
 
-No structured catalogue rows have been produced from these files yet. No
-title filtering, card matching, grading interpretation, or business-level
-deduplication has been applied. The acquisition layer intentionally stores the
-API response before downstream decisions can discard information.
+The acquisition layer intentionally stores the API response before downstream
+decisions can discard information. Matching those responses to catalogue cards
+happens separately, at materialize time, and never changes these files -- see
+[`docs/ebay-matching.md`](./ebay-matching.md).
 
 ## Import runs recorded
 
@@ -199,8 +199,10 @@ it does not mean the stored results were rolled back.
 3. Run the full EU import if EU coverage is desired.
 4. Add safe category/price partitioning before attempting the full
    international import.
-5. Build downstream parsing and matching separately, leaving these raw objects
-   unchanged.
+5. Ingest the sets that eBay listings reference but the catalogue does not
+   contain -- `npm run cli -- ebay-match-report` ranks them by how many
+   listings each would unlock. Japanese promo sets (`S-P`, `SM-P`, `XY-P`) and
+   sets whose cards were never fetched account for most unmatchable listings.
 
 Resetting the router or obtaining a new public IP is not expected to restore
 the quota because the observed limit is tied to the eBay application

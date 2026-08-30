@@ -38,6 +38,21 @@ export const DEFAULT_EBAY_PAGE_LIMIT = 200;
 export const DEFAULT_EBAY_MAX_ITEMS = 0;
 export const EBAY_ALL_BUYING_OPTIONS = ['AUCTION', 'FIXED_PRICE', 'BEST_OFFER', 'CLASSIFIED_AD'] as const;
 
+// Live-auction sweep mode (--live-auctions): a deliberately narrower pass
+// than the general raw-first "capture everything" search above, aimed at
+// eBay's item-detail-per-call quota bottleneck. Confirmed live 2026-08-30:
+// bidCount/currentBidPrice/itemEndDate all come back on the *search*
+// response for free (no item-detail call needed to decide relevance), and
+// filter=buyingOptions:{AUCTION} alone cuts a representative set query's
+// result count by >90% (1,859 -> 164 for "pokemon base set psa 10" on DE)
+// before any bid/end-date filtering. Only items with >=1 bid and an end
+// date inside the window get an item-detail work item at all.
+export const DEFAULT_EBAY_MIN_BID_COUNT = 1;
+export const DEFAULT_EBAY_ENDING_WITHIN_HOURS = 72;
+// Broad on purpose (every card, not one name) -- see seedEbayLiveAuctionSearch
+// for why a single query stays under eBay's 10,000-result cap in this mode.
+export const DEFAULT_EBAY_LIVE_AUCTION_QUERY = 'pokemon psa 10';
+
 const EBAY_ENV_FILE = path.join(PROJECT_ROOT, 'ibbi', '.env');
 
 export interface EbayCredentials {

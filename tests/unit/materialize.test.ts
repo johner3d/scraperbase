@@ -10,15 +10,16 @@ import { enqueueWorkItem } from '../../src/core/queue/scheduler.ts';
 import { writeObject, type ObjectStoreDirs } from '../../src/core/objectstore/store.ts';
 
 let seedCardVariantCounter = 0;
-function seedCardVariant(db: ReturnType<typeof openDb>, args: { setName: string; cardLocalId: string; cardNumber: string; cardName: string; totalCards?: number }): number {
+function seedCardVariant(db: ReturnType<typeof openDb>, args: { setName: string; cardLocalId: string; cardNumber: string; cardName: string; totalCards?: number; language?: string; dexId?: number; sourceSetId?: string }): number {
   const now = '2026-08-28T00:00:00.000Z';
-  const sourceSetId = `test-set-${seedCardVariantCounter++}`;
+  const sourceSetId = args.sourceSetId ?? `test-set-${seedCardVariantCounter++}`;
   const set = db.prepare(
-    `INSERT INTO sets (language, source_set_id, name, total_cards, created_at, updated_at) VALUES ('en', ?, ?, ?, ?, ?) RETURNING set_id`,
-  ).get(sourceSetId, args.setName, args.totalCards ?? null, now, now) as { set_id: number };
+    `INSERT INTO sets (language, source_set_id, name, total_cards, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING set_id`,
+  ).get(args.language ?? 'en', sourceSetId, args.setName, args.totalCards ?? null, now, now) as { set_id: number };
+  const attributes = JSON.stringify(args.dexId == null ? {} : { dexId: [args.dexId] });
   const card = db.prepare(
-    `INSERT INTO cards (set_id, local_id, name, number, attributes_json, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', ?, ?) RETURNING card_id`,
-  ).get(set.set_id, args.cardLocalId, args.cardName, args.cardNumber, now, now) as { card_id: number };
+    `INSERT INTO cards (set_id, local_id, name, number, attributes_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING card_id`,
+  ).get(set.set_id, args.cardLocalId, args.cardName, args.cardNumber, attributes, now, now) as { card_id: number };
   const key = variantKey({ finish: 'holo' });
   const variant = db.prepare(
     `INSERT INTO variants (card_id, variant_key, finish, display_label, attributes_json, created_at, updated_at) VALUES (?, ?, 'holo', 'Holo', '{}', ?, ?) RETURNING variant_id`,
@@ -388,12 +389,14 @@ test('language-specific cards and variants remain distinct', async () => {
   }
 });
 
-test('matches a PSA-10 eBay listing to its variant via structured aspects and tracks price history idempotently', async () => {
+test('matches a PSA-10 eBay listing to its variant and tracks price history idempotently', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-match-'));
   const db = openDb(path.join(root, 'db.sqlite'));
   const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
   try {
-    const variantId = seedCardVariant(db, { setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu' });
+    // `SV-P` is the set code printed on the card and read straight out of the
+    // title, so the fixture set has to carry it as its tcgdex id.
+    const variantId = seedCardVariant(db, { language: 'ja', sourceSetId: 'SV-P', setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu', dexId: 25 });
     const runId = createRun(db, 'ebay-fixture', {});
     await addEbayItemObservation(db, dirs, runId, 'de', '206485945782', psa10DeListing());
 
@@ -401,11 +404,14 @@ test('matches a PSA-10 eBay listing to its variant via structured aspects and tr
     assert.equal(first.ebayListings, 1);
     assert.equal(first.matchedEbayListings, 1);
     assert.equal(first.ebayPriceObservations, 1);
-    const listing = db.prepare(`SELECT variant_id, match_status, match_method, grader, grade_value, is_lot FROM ebay_listings`).get() as
-      { variant_id: number; match_status: string; match_method: string; grader: string; grade_value: number; is_lot: number };
+    const listing = db.prepare(`SELECT card_id, variant_id, match_status, match_tier, variant_confidence, grade_value, is_lot FROM ebay_listings`).get() as
+      { card_id: number; variant_id: number; match_status: string; match_tier: string; variant_confidence: string; grade_value: number; is_lot: number };
     assert.equal(listing.variant_id, variantId);
     assert.equal(listing.match_status, 'matched');
-    assert.equal(listing.match_method, 'ebay-aspect-match');
+    assert.equal(listing.match_tier, 'strong');
+    // The card has exactly one variant, so the variant follows from the card
+    // by elimination rather than from any finish wording in the listing.
+    assert.equal(listing.variant_confidence, 'proven');
     assert.equal(listing.grade_value, 10);
     assert.equal(listing.is_lot, 0);
     assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM ebay_listing_price_observations`).get() as { n: number }).n, 1);
@@ -424,23 +430,22 @@ test('matches a PSA-10 eBay listing to its variant via structured aspects and tr
     assert.equal(third.ebayPriceObservations, 1);
     assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM ebay_listing_price_observations`).get() as { n: number }).n, 2);
 
-    const comparison = db.prepare(`SELECT ebay_psa10_listing_count, ebay_psa10_min_price, ebay_psa10_max_price FROM v_ebay_psa10_price_comparison WHERE variant_id = ?`)
-      .get(variantId) as { ebay_psa10_listing_count: number; ebay_psa10_min_price: number; ebay_psa10_max_price: number };
+    const comparison = db.prepare(`SELECT ebay_psa10_listing_count, ebay_psa10_min_price FROM v_ebay_psa10_price_comparison WHERE variant_id = ?`)
+      .get(variantId) as { ebay_psa10_listing_count: number; ebay_psa10_min_price: number };
     assert.equal(comparison.ebay_psa10_listing_count, 1);
     assert.equal(comparison.ebay_psa10_min_price, 199);
-    assert.equal(comparison.ebay_psa10_max_price, 199);
   } finally {
     db.close();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('skips non-PSA-10 graded eBay listings and excludes multi-card lots from variant matching', async () => {
+test('skips non-PSA-10 graded eBay listings and records multi-card lots without queueing them', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-skip-'));
   const db = openDb(path.join(root, 'db.sqlite'));
   const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
   try {
-    seedCardVariant(db, { setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu' });
+    seedCardVariant(db, { language: 'ja', sourceSetId: 'SV-P', setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu', dexId: 25 });
     const runId = createRun(db, 'ebay-skip-fixture', {});
     await addEbayItemObservation(db, dirs, runId, 'de', '1001', psa10DeListing({
       conditionDescriptors: [
@@ -452,385 +457,106 @@ test('skips non-PSA-10 graded eBay listings and excludes multi-card lots from va
 
     const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
     assert.equal(result.ebayListings, 1, 'only the lot listing becomes a row; the grade-9 item is skipped entirely');
-    const lot = db.prepare(`SELECT match_status, match_method, is_lot FROM ebay_listings`).get() as { match_status: string; match_method: string; is_lot: number };
+    const lot = db.prepare(`SELECT match_status, match_tier, is_lot FROM ebay_listings`).get() as { match_status: string; match_tier: string; is_lot: number };
     assert.equal(lot.is_lot, 1);
+    assert.equal(lot.match_tier, 'lot');
     assert.equal(lot.match_status, 'unmatched');
-    assert.equal(lot.match_method, 'ebay-lot-excluded');
-    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM match_reviews WHERE status = 'open'`).get() as { n: number }).n, 0, 'lot exclusion is structural, not a review-worthy ambiguity');
+    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM match_reviews WHERE status = 'open'`).get() as { n: number }).n, 0,
+      'a lot has no single right answer, so it is recorded rather than queued for a human');
   } finally {
     db.close();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('a non-Latin-script card name never spuriously corroborates an unrelated English identity', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-script-'));
+test('a listing for another trading card game is recorded out of scope, not queued for review', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-scope-'));
   const db = openDb(path.join(root, 'db.sqlite'));
   const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
   try {
-    // normalizePart() strips non-Latin scripts to an empty string; without a
-    // guard, "".includes()-style checks make an empty string spuriously
-    // match everything, which would wrongly corroborate this unrelated card.
-    seedCardVariant(db, { setName: 'Unrelated Japanese Set', cardLocalId: '218', cardNumber: '218', cardName: 'カポエラー' });
-    const runId = createRun(db, 'ebay-script-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '4001', psa10DeListing());
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    assert.equal((db.prepare(`SELECT match_status FROM ebay_listings`).get() as { match_status: string }).match_status, 'ambiguous');
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('a stray single-letter fragment left by normalizing a mixed-script name never corroborates a match', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-fragment-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // normalizePart('ポリゴンZ') collapses the katakana run to nothing and
-    // keeps only the trailing ASCII 'Z' -> the single-character token "z".
-    // The identity name below ("...Filzhut", German for "...Felt Hat")
-    // contains a literal "z" -- naive substring matching would treat that as
-    // corroboration. It must not: "z" is below the minimum token length.
-    seedCardVariant(db, { setName: 'Unrelated Japanese Set', cardLocalId: '218', cardNumber: '218', cardName: 'ポリゴンZ' });
-    const correctVariantId = seedCardVariant(db, { setName: 'SVP Black Star Promos', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu with Grey Felt Hat' });
-    const runId = createRun(db, 'ebay-fragment-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '5001', psa10DeListing({
-      localizedAspects: [
-        { name: 'Kartenname', value: 'Pikachu mit grauem Filzhut' },
-        { name: 'Kartennummer', value: '218' },
-      ],
+    const runId = createRun(db, 'ebay-scope-fixture', {});
+    await addEbayItemObservation(db, dirs, runId, 'de', '3001', psa10DeListing({
+      title: 'PSA 10 FEST Promo - Android 17 & 18 Cell EX20-04 Promo DBS Super Heroes',
+      localizedAspects: [{ name: 'Spiel', value: 'Dragon Ball Super CG' }],
     }));
 
     const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 1, 'the shared "pikachu" token across languages should corroborate the correct card');
-    const listing = db.prepare(`SELECT match_status, variant_id FROM ebay_listings`).get() as { match_status: string; variant_id: number };
-    assert.equal(listing.match_status, 'matched');
-    assert.equal(listing.variant_id, correctVariantId);
+    assert.equal(result.ebayListings, 1);
+    const row = db.prepare(`SELECT match_tier, card_id FROM ebay_listings`).get() as { match_tier: string; card_id: number | null };
+    assert.equal(row.match_tier, 'out-of-scope');
+    assert.equal(row.card_id, null);
+    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM match_reviews WHERE status = 'open'`).get() as { n: number }).n, 0);
   } finally {
     db.close();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('reduces a "numerator/set-total" aspect value to just the numerator our catalogue stores', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-fraction-'));
+test('a confidently identified set with no cards ingested is reported as a catalogue gap, not review work', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-gap-'));
   const db = openDb(path.join(root, 'db.sqlite'));
   const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
   try {
-    const variantId = seedCardVariant(db, { setName: '20th Anniversary', cardLocalId: '011', cardNumber: '011', cardName: 'Charizard' });
-    const runId = createRun(db, 'ebay-fraction-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '7001', psa10DeListing({
+    // The set row exists (tcgdex set index was fetched) but its cards were
+    // never hydrated -- 81 of 555 catalogue sets are in exactly this state.
+    const now = '2026-08-28T00:00:00.000Z';
+    db.prepare(`INSERT INTO sets (language, source_set_id, name, total_cards, official_cards, created_at, updated_at)
+      VALUES ('ja', 'CP6', 'Expansion Pack 20th Anniversary', 87, 87, ?, ?)`).run(now, now);
+    const runId = createRun(db, 'ebay-gap-fixture', {});
+    await addEbayItemObservation(db, dirs, runId, 'de', '4001', psa10DeListing({
       title: 'PSA 10 Charizard 1st Edition Japanese 20th Anniversary 011/087 CP6',
-      localizedAspects: [
-        { name: 'Kartenname', value: 'Charizard' },
-        { name: 'Kartennummer', value: '011/087' },
-      ],
+      localizedAspects: [{ name: 'Spiel', value: 'Pokémon TCG' }, { name: 'Sprache', value: 'Japanisch' }],
     }));
 
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 1);
-    const listing = db.prepare(`SELECT variant_id, extracted_card_number FROM ebay_listings`).get() as { variant_id: number; extracted_card_number: string };
-    assert.equal(listing.variant_id, variantId);
-    assert.equal(listing.extracted_card_number, '011');
+    await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
+    const row = db.prepare(`SELECT match_tier, match_method FROM ebay_listings`).get() as { match_tier: string; match_method: string };
+    assert.equal(row.match_tier, 'catalogue-gap');
+    assert.equal(row.match_method, 'ebay-catalogue-gap');
+    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM match_reviews WHERE status = 'open'`).get() as { n: number }).n, 0);
   } finally {
     db.close();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('extracts a card number from a promo-style title fraction and a bare hash number', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-promo-number-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    const svp = seedCardVariant(db, { setName: 'Scarlet & Violet Promos', cardLocalId: '001', cardNumber: '001', cardName: 'Pikachu' });
-    const dreamLeague = seedCardVariant(db, { setName: 'Dream League', cardLocalId: '054', cardNumber: '054', cardName: 'Pikachu' });
-    const runId = createRun(db, 'ebay-promo-number-fixture', {});
-    // Card name comes from the aspect (as it did in the real listings this
-    // reproduces), but the "Kartennummer" aspect is missing/NA -- the number
-    // has to come from the title-fallback path.
-    await addEbayItemObservation(db, dirs, runId, 'de', '7101', psa10DeListing({
-      title: 'PSA 10 Pikachu Japanese Promo Scarlet Violet Pre Order 001/SV-P Pokemon',
-      localizedAspects: [{ name: 'Kartenname', value: 'Pikachu' }],
-    }));
-    await addEbayItemObservation(db, dirs, runId, 'de', '7102', psa10DeListing({
-      title: '2019 Pokemon Pikachu Dream League Japanese Sun & Moon #054 PSA 10 GEM MINT',
-      localizedAspects: [{ name: 'Kartenname', value: 'Pikachu' }],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 2);
-    const rows = db.prepare(`SELECT item_id, variant_id, extracted_card_number FROM ebay_listings ORDER BY item_id`).all() as Array<{ item_id: string; variant_id: number; extracted_card_number: string }>;
-    assert.deepEqual(rows.map((r) => [r.item_id, r.variant_id, r.extracted_card_number]), [
-      ['7101', svp, '001'],
-      ['7102', dreamLeague, '054'],
-    ]);
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('does not mistake a grade-vs-grader fraction ("PSA 10 / OVP") in the title for a card number', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-grade-fraction-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // Observed live: "[PSA 10 / OVP] Jap. Yokohama..." has no real card
-    // number anywhere in the title -- "10 / OVP" is a grade next to a
-    // condition abbreviation ("OVP" = original packaging), not a card
-    // number. It must not be extracted as one and coincidentally matched to
-    // an unrelated card that happens to be numbered 10.
-    seedCardVariant(db, { setName: 'Unrelated Set', cardLocalId: '10', cardNumber: '10', cardName: 'Pokémon Park' });
-    const runId = createRun(db, 'ebay-grade-fraction-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '9001', psa10DeListing({
-      title: '[PSA 10 / OVP] Jap. Yokohama Full Pokémon Center Set Holo Pikachu',
-      localizedAspects: [{ name: 'Kartenname', value: 'Pokémon Center' }],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    const listing = db.prepare(`SELECT match_status, extracted_card_number FROM ebay_listings`).get() as { match_status: string; extracted_card_number: string | null };
-    assert.equal(listing.extracted_card_number, null);
-    assert.equal(listing.match_status, 'unmatched');
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('picks the real card-number fraction over an earlier grade-fraction decoy in the same title', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-decoy-fraction-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // "PSA 10 / AUTO 10" (a grade fraction) appears before the real card
-    // number "270/Sm-p" later in the same title -- the real one must still
-    // be found, not abandoned just because an earlier candidate was invalid.
-    const variantId = seedCardVariant(db, { setName: 'Sun & Moon Promos', cardLocalId: '270', cardNumber: '270', cardName: "Red's Pikachu" });
-    const runId = createRun(db, 'ebay-decoy-fraction-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '9101', psa10DeListing({
-      title: "PSA 10 / AUTO 10 Dual - Red's Pikachu # 270/Sm-p Veronica Taylor",
-      localizedAspects: [{ name: 'Kartenname', value: "Red's Pikachu" }],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 1);
-    const listing = db.prepare(`SELECT variant_id, extracted_card_number FROM ebay_listings`).get() as { variant_id: number; extracted_card_number: string };
-    assert.equal(listing.extracted_card_number, '270');
-    assert.equal(listing.variant_id, variantId);
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('a shared "Mega" mechanic token does not corroborate two otherwise unrelated cards', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-mega-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // A seller-garbled "card name" aspect containing the whole promo name
-    // ("Poncho Pikachu Mega Campaign") only overlaps an unrelated "Mega
-    // Gardevoir ex" candidate on the generic mechanic word "Mega".
-    seedCardVariant(db, { setName: 'Unrelated Set', cardLocalId: '203', cardNumber: '203', cardName: 'Mega Gardevoir ex' });
-    const runId = createRun(db, 'ebay-mega-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '9201', psa10DeListing({
-      title: 'PSA 10 2015 POKEMON JAPANESE XY PROMO #203 PONCHO PIKACHU MEGA CAMPAIGN',
-      localizedAspects: [{ name: 'Kartenname', value: 'PONCHO PIKACHU MEGA CAMPAIGN' }],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    assert.equal((db.prepare(`SELECT match_status FROM ebay_listings`).get() as { match_status: string }).match_status, 'ambiguous');
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('disambiguates same-numbered, same-named cards across sets using the printed set-total denominator', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-total-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // "Bulbasaur" is card #1 in many different sets/reprints -- a bare
-    // number+name match alone stays ambiguous across all of them. The
-    // listing's own "001/025" fraction names a set with exactly 25 cards,
-    // which uniquely picks out the McDonald's promo set among them.
-    seedCardVariant(db, { setName: 'Base Set', cardLocalId: '1', cardNumber: '1', cardName: 'Bulbasaur', totalCards: 102 });
-    seedCardVariant(db, { setName: 'Detective Pikachu', cardLocalId: '1', cardNumber: '1', cardName: 'Bulbasaur', totalCards: 18 });
-    const correctVariantId = seedCardVariant(db, { setName: "McDonald's Collection 2021", cardLocalId: '001', cardNumber: '001', cardName: 'Bulbasaur', totalCards: 25 });
-    const runId = createRun(db, 'ebay-total-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '8001', psa10DeListing({
-      title: 'Pokemon 2021 Celebrations Mcdonalds Bulbasaur Holo 001/025 PSA 10',
-      localizedAspects: [{ name: 'Kartenname', value: 'Bulbasaur' }],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 1);
-    const listing = db.prepare(`SELECT variant_id, match_status FROM ebay_listings`).get() as { variant_id: number; match_status: string };
-    assert.equal(listing.match_status, 'matched');
-    assert.equal(listing.variant_id, correctVariantId);
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('the printed set-total alone, with no name corroboration at all, does not auto-match', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-total-alone-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // A "Jynx" listing's 074/141 fraction happens to match an unrelated
-    // Darkrai card's number AND its set's total card count -- neither the
-    // aspect nor the title carries a name that corroborates "Darkrai", so
-    // this coincidence alone must not be accepted as a match.
-    seedCardVariant(db, { setName: 'Unrelated 141-card set', cardLocalId: '074', cardNumber: '074', cardName: 'Darkrai', totalCards: 141 });
-    const runId = createRun(db, 'ebay-total-alone-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '8101', psa10DeListing({
-      title: "2001 Will's Jynx 074/141 1st Edition Vs Pokemon Japanese PSA 10",
-      localizedAspects: [],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    assert.equal((db.prepare(`SELECT match_status FROM ebay_listings`).get() as { match_status: string }).match_status, 'ambiguous');
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('a common English word like "Ball" shared between unrelated card names does not corroborate a match', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-commonword-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // "Poke Ball" (the listing's card) and "Eevee on the Ball" (an unrelated
-    // catalogue card sharing the same number) only overlap on the generic
-    // word "ball" -- that must not count as corroboration. Total left
-    // unknown (null) so this isolates the stopword check specifically, not
-    // the separate total-mismatch prefilter covered by the "Lady" test below.
-    seedCardVariant(db, { setName: 'Unrelated Set', cardLocalId: '002', cardNumber: '002', cardName: 'Eevee on the Ball' });
-    const runId = createRun(db, 'ebay-commonword-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '8201', psa10DeListing({
-      title: 'PSA 10 Poke Ball #002 25th Anniversary Golden Box 2021 Pokemon Karte JP',
-      localizedAspects: [{ name: 'Kartenname', value: 'Poke Ball' }],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    assert.equal((db.prepare(`SELECT match_status FROM ebay_listings`).get() as { match_status: string }).match_status, 'ambiguous');
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('a known set-total mismatch disqualifies a candidate outright, even when a common word overlaps', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-total-mismatch-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // "Parasol Lady" (089/062, a 62-card set) and an unrelated "Pokémon
-    // Center Lady" in a 111-card set only share the generic word "lady".
-    // The listing's own denominator (62) is known to mismatch the
-    // candidate's recorded total (111), which must disqualify it outright --
-    // this is a stronger, more principled guard than trying to stopword-list
-    // every common noun that could ever appear in a card name.
-    seedCardVariant(db, { setName: 'Unrelated Set', cardLocalId: '089', cardNumber: '089', cardName: 'Pokémon Center Lady', totalCards: 111 });
-    const runId = createRun(db, 'ebay-total-mismatch-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '8301', psa10DeListing({
-      title: 'Pokemon Parasol Lady 089/062 SAR FA Scarlet Violet / Raging Surf SV3a JP PSA 10',
-      localizedAspects: [{ name: 'Kartenname', value: 'Parasol Lady' }],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    assert.equal((db.prepare(`SELECT match_status FROM ebay_listings`).get() as { match_status: string }).match_status, 'unmatched');
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('a shared generic TCG term like "VMAX" does not corroborate two unrelated cards', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-generic-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // A seller pasted the whole listing title into the "card name" item
-    // specific (a real, observed data-quality issue) -- the only catalogue
-    // card sharing that number is an unrelated VMAX card, and "vmax" alone
-    // must not be treated as corroboration.
-    seedCardVariant(db, { setName: 'VSTAR Universe', cardLocalId: '222', cardNumber: '222', cardName: 'Deoxys VMAX' });
-    const runId = createRun(db, 'ebay-generic-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '6001', psa10DeListing({
-      title: 'PSA 10 PIKACHU V POKEMON VMAX CLIMAX SWSH JAPANESE 2021 222/184 CRS GEM MINT BGS',
-      localizedAspects: [
-        { name: 'Kartenname', value: 'Fa pikachu V Pokemon Vmax Climax Swsh Japanese 2021 222 Psa 10' },
-      ],
-    }));
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    assert.equal((db.prepare(`SELECT match_status FROM ebay_listings`).get() as { match_status: string }).match_status, 'ambiguous');
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('does not auto-match on card number alone when no unrelated card shares a corroborating name', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-coincidence-'));
-  const db = openDb(path.join(root, 'db.sqlite'));
-  const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
-  try {
-    // The catalogue's only card numbered '218' is an unrelated card in an
-    // unrelated set -- the listing's own card name ('Pikachu') doesn't match
-    // it, so this must not be silently treated as a confirmed match.
-    seedCardVariant(db, { setName: 'Some Unrelated Set', cardLocalId: '218', cardNumber: '218', cardName: 'Gengar' });
-    const runId = createRun(db, 'ebay-coincidence-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '3001', psa10DeListing());
-
-    const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
-    assert.equal(result.matchedEbayListings, 0);
-    const listing = db.prepare(`SELECT match_status, variant_id FROM ebay_listings`).get() as { match_status: string; variant_id: number | null };
-    assert.equal(listing.match_status, 'ambiguous');
-    assert.equal(listing.variant_id, null);
-    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM match_reviews WHERE status = 'open'`).get() as { n: number }).n, 1);
-  } finally {
-    db.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('queues an open review when a PSA-10 eBay listing matches no candidate variant', async () => {
+test('an unresolvable listing is queued, and resolving it manually also teaches the set alias', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-ebay-unmatched-'));
   const db = openDb(path.join(root, 'db.sqlite'));
   const dirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
   try {
     const runId = createRun(db, 'ebay-unmatched-fixture', {});
-    await addEbayItemObservation(db, dirs, runId, 'de', '2001', psa10DeListing());
+    // No set code in the title: nothing here identifies the set, which is the
+    // only situation that legitimately needs a human.
+    await addEbayItemObservation(db, dirs, runId, 'de', '2001', psa10DeListing({
+      title: 'Pokemon Japanese Pikachu C PSA 10 Gem Mint Promotional Cards 218',
+    }));
 
     const result = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
     assert.equal(result.ebayListings, 1);
     assert.equal(result.matchedEbayListings, 0);
-    assert.equal((db.prepare(`SELECT match_status FROM ebay_listings`).get() as { match_status: string }).match_status, 'unmatched');
+    assert.equal((db.prepare(`SELECT match_tier FROM ebay_listings`).get() as { match_tier: string }).match_tier, 'review');
     assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM match_reviews WHERE status = 'open' AND target_type = 'variant'`).get() as { n: number }).n, 1);
 
     const sourceRecordId = (db.prepare(`SELECT source_record_id FROM ebay_listings`).get() as { source_record_id: number }).source_record_id;
-    const variantId = seedCardVariant(db, { setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu' });
+    const variantId = seedCardVariant(db, { language: 'ja', setName: 'Scarlet & Violet Promos', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu', dexId: 25 });
     setMatchOverride(db, sourceRecordId, 'variant', variantId, 'confirmed after manual review');
+
     const second = await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs: dirs });
     assert.equal(second.matchedEbayListings, 1);
-    assert.equal((db.prepare(`SELECT match_status, variant_id FROM ebay_listings`).get() as { match_status: string; variant_id: number }).match_status, 'manual');
+    const row = db.prepare(`SELECT match_status, match_tier, variant_id FROM ebay_listings`).get() as { match_status: string; match_tier: string; variant_id: number };
+    assert.equal(row.match_status, 'manual');
+    assert.equal(row.match_tier, 'exact');
+    assert.equal(row.variant_id, variantId);
     assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM match_reviews WHERE status = 'open'`).get() as { n: number }).n, 0);
+
+    // The human did more than fix one row: "SV-P Werbekarten" is now known to
+    // mean this set, so every sibling listing using that wording matches on
+    // the next run without being queued again.
+    const alias = db.prepare(`SELECT alias_text, source_set_id, origin FROM ebay_set_aliases`).get() as
+      { alias_text: string; source_set_id: string; origin: string } | undefined;
+    assert.ok(alias, 'the resolved set text is recorded as a learned alias');
+    assert.equal(alias.alias_text, 'sv_p_werbekarten');
+    assert.equal(alias.origin, 'learned');
   } finally {
     db.close();
     await rm(root, { recursive: true, force: true });

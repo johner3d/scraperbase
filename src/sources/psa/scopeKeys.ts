@@ -42,3 +42,12 @@ export function popYearScopeKey(yearHeadingId: string): string {
 export function popSetItemsScopeKey(headingId: string): string {
   return `pop_set_items:${headingId}`;
 }
+
+/**
+ * One PSA certification-number lookup. Keyed on the cert itself, not on the
+ * listing that mentioned it: the same slab is relisted repeatedly and by
+ * several sellers, and the cert resolves to the same card every time.
+ */
+export function certScopeKey(certNumber: string): string {
+  return `cert:${certNumber}`;
+}

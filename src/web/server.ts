@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer as createViteServer, type ViteDevServer } from 'vite';
 import { DB_PATH, MEDIA_CACHE_DIR, OBJECTS_DIR } from '../core/config/config.ts';
-import { getCard, getFacets, getHealth, getMarket, getPopulation, getVariant, listCards, listMatchReviews, listSources, listVariants } from './api.ts';
+import { getAuction, getAuctionFacets, getCard, getFacets, getHealth, getMarket, getPopulation, getVariant, listAuctions, listCards, listMatchReviews, listSources, listVariants } from './api.ts';
 import { safeStoredPath } from './mediaPath.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -26,6 +26,7 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function idFromPath(pathname: string, prefix: string): number | null {
+  if (!pathname.startsWith(prefix)) return null;
   const value = pathname.slice(prefix.length);
   return /^\d+$/.test(value) ? Number(value) : null;
 }
@@ -44,10 +45,14 @@ async function apiHandler(db: DatabaseSync, req: IncomingMessage, res: ServerRes
   try {
     if (url.pathname === '/api/cards') { json(res, 200, listCards(db, url.searchParams)); return true; }
     if (url.pathname === '/api/variants') { json(res, 200, listVariants(db, url.searchParams)); return true; }
+    if (url.pathname === '/api/auctions') { json(res, 200, listAuctions(db, url.searchParams)); return true; }
+    if (url.pathname === '/api/auction-facets') { json(res, 200, getAuctionFacets(db)); return true; }
     if (url.pathname === '/api/sources') { json(res, 200, { items: listSources(db) }); return true; }
     if (url.pathname === '/api/facets') { json(res, 200, getFacets(db)); return true; }
     if (url.pathname === '/api/reviews') { json(res, 200, { items: listMatchReviews(db) }); return true; }
     if (url.pathname === '/api/health') { json(res, 200, getHealth(db)); return true; }
+    const auctionId = idFromPath(url.pathname, '/api/auctions/');
+    if (auctionId != null) { const result = getAuction(db, auctionId); json(res, result ? 200 : 404, result ?? { error: 'Auction not found' }); return true; }
     const cardId = idFromPath(url.pathname, '/api/cards/');
     if (cardId != null) { const result = getCard(db, cardId); json(res, result ? 200 : 404, result ?? { error: 'Card not found' }); return true; }
     const variantMarket = url.pathname.match(/^\/api\/variants\/(\d+)\/(market|population)$/);
@@ -68,6 +73,13 @@ async function apiHandler(db: DatabaseSync, req: IncomingMessage, res: ServerRes
 async function mediaHandler(db: DatabaseSync, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   if (req.method !== 'GET' || !url.pathname.startsWith('/media/')) return false;
+  const auctionId = idFromPath(url.pathname, '/media/ebay/');
+  if (auctionId != null) {
+    const listing=db.prepare(`SELECT primary_image_url FROM ebay_listings WHERE ebay_listing_id=?`).get(auctionId) as {primary_image_url?:string}|undefined;
+    const sourceUrl=listing?.primary_image_url;
+    if(!sourceUrl||!/^https:\/\//i.test(sourceUrl)){json(res,404,{error:'Auction image not found'});return true;}
+    await serveCachedRemote(sourceUrl,res);return true;
+  }
   const cardId = idFromPath(url.pathname, '/media/card/');
   if (cardId != null) {
     const asset = db.prepare(`SELECT a.media_type,a.object_hash,a.url,ro.storage_path FROM cards c

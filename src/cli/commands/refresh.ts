@@ -9,7 +9,8 @@ export async function refreshCommand(args: string[]): Promise<void> {
   }});
   const tcgdexQueues: Record<string, string[]> = { index: ['tcgdex_discovery', 'catalogue_json'], details: ['catalogue_json'], images: ['images'], all: ['tcgdex_discovery', 'catalogue_json', 'images'] };
   const ebayQueues: Record<string, string[]> = { search: ['ebay_search'], detail: ['ebay_item_detail'], all: ['ebay_search', 'ebay_item_detail'] };
-  const queues = values.source === 'ebay' ? ebayQueues : tcgdexQueues;
+  const ecbQueues: Record<string, string[]> = { rates: ['ecb_rates'], all: ['ecb_rates'] };
+  const queues = values.source === 'ebay' ? ebayQueues : values.source === 'ecb' ? ecbQueues : tcgdexQueues;
   const selected = queues[String(values.stage)];
   if (!selected) throw new Error(`Invalid --stage ${values.stage}`);
   const db = openCliDb();
