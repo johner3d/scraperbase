@@ -15,6 +15,9 @@ export interface StageStatusRow {
   dead_letter_open: number;
   next_eligible_at: string | null;
   note: string | null;
+  auto_enabled: number;
+  run_requested_at: string | null;
+  run_drain: number;
 }
 
 const WINDOW_MS = 5 * 60_000;

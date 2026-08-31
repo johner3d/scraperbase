@@ -22,10 +22,10 @@ const PSA_TARGET_CAP = 500;
  */
 export const tickPsaIdentity: StageTick = async (db, ctx) => {
   const idle = () => ({ nextEligibleAt: new Date(ctx.now().getTime() + IDLE_MINUTES * 60_000).toISOString() });
-  const before = selectEbayMatchedTargets(db, { tiers: ['exact', 'strong'], excludeFlagged: true, activeOnly: true });
+  const before = selectEbayMatchedTargets(db, { liveAuctionsOnly: true });
 
   if (before.unresolvedVariants === 0) {
-    const manifest = snapshotPsaTargets(db, ctx.pipelineRunId, { refresh: true, activeOnly: true, cap: PSA_TARGET_CAP, ebayComplete: true });
+    const manifest = snapshotPsaTargets(db, ctx.pipelineRunId, { refresh: true, liveAuctionsOnly: true, cap: PSA_TARGET_CAP, ebayComplete: true });
     return { workDone: 0, note: `identity complete; ${manifest.specs} live target spec(s)`, ...idle() };
   }
 
@@ -47,9 +47,9 @@ export const tickPsaIdentity: StageTick = async (db, ctx) => {
   if (!outcome.ok) return { workDone: 0, pause: outcome.pause, note: outcome.pause.reason };
 
   await materialize(db, { includeTcgdex: false, includePsa: true, includeEbay: false, includeEcb: false, pipelineRunId: ctx.pipelineRunId });
-  const after = selectEbayMatchedTargets(db, { tiers: ['exact', 'strong'], excludeFlagged: true, activeOnly: true });
+  const after = selectEbayMatchedTargets(db, { liveAuctionsOnly: true });
   const resolved = Math.max(0, before.unresolvedVariants - after.unresolvedVariants);
-  const manifest = snapshotPsaTargets(db, ctx.pipelineRunId, { refresh: true, activeOnly: true, cap: PSA_TARGET_CAP, ebayComplete: true });
+  const manifest = snapshotPsaTargets(db, ctx.pipelineRunId, { refresh: true, liveAuctionsOnly: true, cap: PSA_TARGET_CAP, ebayComplete: true });
   syncPsaCoverage(db, ctx.pipelineRunId);
   if (resolved > 0) markPublishDirty(db);
   ctx.log(`psa-identity: resolved ${resolved} variant(s); ${after.unresolvedVariants} still unresolved; ${manifest.specs} live targets`);

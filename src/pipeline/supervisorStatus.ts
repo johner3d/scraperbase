@@ -51,8 +51,19 @@ export function supervisorStatus(db: DatabaseSync): SupervisorStatusView {
       lastActivityAt: row.last_activity_at,
       nextEligibleAt: row.next_eligible_at,
       note: row.note,
+      autoEnabled: row.auto_enabled === 1,
+      runRequestedAt: row.run_requested_at,
     };
   });
+
+  const activeStages = (() => {
+    if (!state.run_id) return null;
+    const run = db.prepare(`SELECT config_json FROM runs WHERE run_id=?`).get(state.run_id) as { config_json: string } | undefined;
+    try {
+      const cfg = run ? JSON.parse(run.config_json) as { stages?: unknown } : {};
+      return Array.isArray(cfg.stages) && cfg.stages.length ? cfg.stages.map(String) : null;
+    } catch { return null; }
+  })();
 
   const terms: TermFunnelView[] = (db.prepare(`SELECT * FROM ebay_search_terms ORDER BY enabled DESC, priority DESC, search_term_id`)
     .all() as Array<Record<string, unknown>>).map((t) => {
@@ -128,6 +139,7 @@ export function supervisorStatus(db: DatabaseSync): SupervisorStatusView {
     lastPublishAt: state.last_publish_at,
     quota: ebayQuotaState(db),
     stages,
+    activeStages,
     terms,
     deadLetters,
     activePauses,

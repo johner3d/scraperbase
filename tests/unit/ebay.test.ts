@@ -93,9 +93,22 @@ test('selectLiveAuctionItems: keeps only items with enough bids that end before 
     { itemId: 'd', bidCount: 5, itemEndDate: '2026-09-05T00:00:00.000Z' }, // past cutoff -- stop here
     { itemId: 'e', bidCount: 9, itemEndDate: '2026-09-06T00:00:00.000Z' }, // never reached
   ];
-  const result = selectLiveAuctionItems(summaries, { minBidCount: 1, endingBeforeAt: cutoff });
+  const result = selectLiveAuctionItems(summaries, { minBidCount: 1, endingBeforeAt: cutoff, now: '2026-08-30T00:00:00.000Z' });
   assert.deepEqual(result.itemIds, ['a', 'c']);
   assert.equal(result.pastCutoff, true);
+});
+
+test('selectLiveAuctionItems: an already-ended auction is skipped even when it is within the cutoff window', () => {
+  const now = '2026-08-31T00:00:00.000Z';
+  const cutoff = '2026-09-03T00:00:00.000Z';
+  const summaries = [
+    { itemId: 'past', bidCount: 4, itemEndDate: '2026-08-30T12:00:00.000Z' }, // already ended -- skip
+    { itemId: 'now', bidCount: 4, itemEndDate: now },                          // ends exactly now -- skip
+    { itemId: 'live', bidCount: 4, itemEndDate: '2026-09-01T00:00:00.000Z' },  // still live -- keep
+  ];
+  const result = selectLiveAuctionItems(summaries, { minBidCount: 1, endingBeforeAt: cutoff, now });
+  assert.deepEqual(result.itemIds, ['live']);
+  assert.equal(result.pastCutoff, false);
 });
 
 test('selectLiveAuctionItems: with no cutoff configured, only the bid-count filter applies', () => {

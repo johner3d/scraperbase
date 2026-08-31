@@ -306,6 +306,60 @@ async function fetchSalesPage(page: Page, specId: number, pageNumber: number): P
   throw lastError;
 }
 
+export interface PriceSummaryGrade {
+  grade: number;
+  metrics: {
+    quantity: number; minimumPrice: number; maximumPrice: number;
+    averagePrice: number; latestPrice: number; totalValue: number;
+  };
+}
+
+/**
+ * Per-grade price metrics from `researchJourney.getPriceSummary` -- the same
+ * spec-keyed tRPC call psacard.com's own /spec/psa/{id} page uses to show
+ * prices. Unlike the CardFacts HTML page it needs no set slug, so it works for
+ * every spec, not just Base Set. `department: 'psa'` is what the site sends.
+ */
+async function fetchPriceSummary(page: Page, specId: number): Promise<PriceSummaryGrade[]> {
+  const input = {
+    json: { specId: String(specId), department: 'psa', salesSummaryType: 'GRADES',
+      gradingType: 'ALL', qualifiers: 'NON_QUALIFIERS', timeRange: 0 },
+    meta: { values: {}, v: 1 },
+  };
+  const innerBase64 = Buffer.from(JSON.stringify(input)).toString('base64');
+  const url = `https://www.psacard.com/api/psa/trpc/researchJourney.getPriceSummary?batch=1&input=${encodeURIComponent(JSON.stringify({ 0: innerBase64 }))}`;
+  const { status, body } = await withTimeout(
+    page.evaluate(async (u) => {
+      const res = await fetch(u);
+      return { status: res.status, body: await res.text() };
+    }, url),
+    EVALUATE_TIMEOUT_MS,
+    `price summary fetch (spec ${specId})`,
+  );
+  if (status !== 200) throw new Error(`Price summary request failed with ${status}: ${body.slice(0, 200)}`);
+  const parsed = JSON.parse(body) as Array<{
+    result?: { data?: { json?: { salesSummary?: PriceSummaryGrade[] } } };
+    error?: { json?: { message?: string } };
+  }>;
+  if (parsed[0]?.error) throw new Error(`Price summary API error: ${parsed[0].error.json?.message ?? 'unknown'}`);
+  return parsed[0]?.result?.data?.json?.salesSummary ?? [];
+}
+
+/** getPriceSummary metrics -> the CardFacts-page RawPriceRow shape the importer reads. */
+function priceSummaryToRows(summary: PriceSummaryGrade[]): RawPriceRow[] {
+  return summary
+    .filter((g) => g && g.metrics)
+    .map((g) => ({
+      gradeText: String(g.grade),
+      mostRecentText: g.metrics.latestPrice != null ? String(g.metrics.latestPrice) : '',
+      averageText: g.metrics.averagePrice != null ? String(g.metrics.averagePrice) : '',
+      // PSA's editorial "PSA Price" only lives on the CardFacts HTML page; the
+      // sales-derived average is the closest spec-keyed proxy, and it's the
+      // value psacard.com's own spec page shows.
+      psaPriceText: g.metrics.averagePrice != null ? String(g.metrics.averagePrice) : '',
+    }));
+}
+
 async function fetchPopulationOne(page: Page, entry: Selection, outDir: string): Promise<string> {
   const populationRaw = await withTimeout(
     page.evaluate(async (specId) => {
@@ -316,16 +370,30 @@ async function fetchPopulationOne(page: Page, entry: Selection, outDir: string):
     EVALUATE_TIMEOUT_MS,
     `population fetch (spec ${entry.psaSpecId})`,
   );
-  const { html, priceRows, censusRows } = await withTimeout(
+  const scraped = await withTimeout(
     page.evaluate(extractPageData, entry.popSourceUrl),
     EVALUATE_TIMEOUT_MS,
     `page fetch (spec ${entry.psaSpecId})`,
   );
+  const { html, censusRows } = scraped;
+  let priceRows = scraped.priceRows;
+  // The CardFacts price table only renders when the URL's set slug matches the
+  // card's set (Base Set specs only, given cardFactsUrl's fixed slug). For every
+  // other spec fall back to the slug-free price-summary API.
+  let priceSummary: PriceSummaryGrade[] = [];
+  if (priceRows.length === 0) {
+    try {
+      priceSummary = await fetchPriceSummary(page, entry.psaSpecId);
+      priceRows = priceSummaryToRows(priceSummary);
+    } catch (err) {
+      console.warn(`  price-summary fallback failed for ${entry.psaSpecId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   const outPath = path.join(outDir, `${entry.psaSpecId}.json`);
   atomicWriteJson(outPath, {
-    ...entry, fetchedAt: new Date().toISOString(), populationRaw, priceRows, censusRows, html,
+    ...entry, fetchedAt: new Date().toISOString(), populationRaw, priceRows, priceSummary, censusRows, html,
   });
-  console.log(`  saved (${priceRows.length} price rows, ${censusRows.length} census rows, ${html.length} bytes of page HTML)`);
+  console.log(`  saved (${priceRows.length} price rows${priceSummary.length ? ' via price-summary API' : ''}, ${censusRows.length} census rows, ${html.length} bytes of page HTML)`);
   return outPath;
 }
 

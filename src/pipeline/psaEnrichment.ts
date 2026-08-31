@@ -23,16 +23,36 @@ interface Params { selection:Selection; maxAgeDays:number; salesAuditDays:number
 export function psaEnrichmentScope(phase:'population'|'sales',specId:number):string{return `enrichment:${phase}:spec=${specId}`;}
 const scope=psaEnrichmentScope;
 
-export function seedPsaEnrichment(db:DatabaseSync,selections:Selection[],maxAgeDays:number,salesAuditDays:number):void{
+/**
+ * Enqueue population/sales work for `selections`. Normally it also re-pends any
+ * globally-stale succeeded item (older than `maxAgeDays`). With `opts.force` it
+ * skips that global sweep and instead re-pends exactly the passed selections
+ * with a zero max-age, so their collectors re-fetch even a fresh cached file --
+ * used when the caller already knows the cache is missing or wrong-source.
+ */
+export function seedPsaEnrichment(db:DatabaseSync,selections:Selection[],maxAgeDays:number,salesAuditDays:number,opts:{force?:boolean}={}):void{
   const now=new Date().toISOString();const staleBefore=new Date(Date.now()-maxAgeDays*DAY_MS).toISOString();
+  const effectiveMaxAge=opts.force?0:maxAgeDays;
+  const forcedIds:string[]=[];
   for(const selection of selections){
-    const params:Params={selection,maxAgeDays,salesAuditDays};
+    const params:Params={selection,maxAgeDays:effectiveMaxAge,salesAuditDays};
     enqueueWorkItem(db,{source:'psa',queue:POP_QUEUE,entityType:'population_snapshot',scopeKey:scope('population',selection.psaSpecId),params});
     db.prepare('UPDATE work_items SET params_json=? WHERE work_item_id=?').run(JSON.stringify(params),workItemId('psa',POP_QUEUE,scope('population',selection.psaSpecId)));
+    forcedIds.push(workItemId('psa',POP_QUEUE,scope('population',selection.psaSpecId)));
     if(selection.salesSpecId!=null){
       enqueueWorkItem(db,{source:'psa',queue:SALES_QUEUE,entityType:'sales_snapshot',scopeKey:scope('sales',selection.salesSpecId),params});
       db.prepare('UPDATE work_items SET params_json=? WHERE work_item_id=?').run(JSON.stringify(params),workItemId('psa',SALES_QUEUE,scope('sales',selection.salesSpecId)));
+      forcedIds.push(workItemId('psa',SALES_QUEUE,scope('sales',selection.salesSpecId)));
     }
+  }
+  if(opts.force){
+    // Re-pend the selection's items from ANY non-active state -- including
+    // 'cancelled', which `pipeline reset` uses and `enqueueWorkItem` (INSERT OR
+    // IGNORE) can't revive.
+    db.prepare(`UPDATE work_items SET state='pending',attempts=0,available_at=?,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL,updated_at=?
+      WHERE work_item_id IN (${forcedIds.map(()=>'?').join(',')})
+        AND state IN ('succeeded','permanent_failed','partial','cancelled','retryable_failed')`).run(now,now,...forcedIds);
+    return;
   }
   db.prepare(`UPDATE work_items SET state='pending',attempts=0,available_at=?,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL,updated_at=?
     WHERE source='psa' AND queue IN (?,?) AND state='succeeded' AND updated_at<?`).run(now,now,POP_QUEUE,SALES_QUEUE,staleBefore);

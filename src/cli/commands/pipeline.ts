@@ -3,7 +3,7 @@ import { openCliDb } from '../context.ts';
 import { pipelineReviewCommand } from './pipeline-review.ts';
 import { pipelineTermsCommand } from './pipeline-terms.ts';
 import { pipelineDeadLetterCommand, pipelineFailuresCommand, pipelineRetryCommand } from './pipeline-failures.ts';
-import { pipelinePublishCommand, pipelineStartCommand, pipelineStatusCommand, pipelineStopCommand, pipelineTickCommand } from './pipeline-supervisor.ts';
+import { pipelinePublishCommand, pipelineResetCommand, pipelineStageCommand, pipelineStartCommand, pipelineStatusCommand, pipelineStopCommand, pipelineTickCommand } from './pipeline-supervisor.ts';
 import { createPipelineRun, loadPipelineRun, resumePipelineRun, stageReport } from '../../pipeline/store.ts';
 import { executeExistingPsaRefresh, executePipeline, pipelineDryRun, PipelinePausedError } from '../../pipeline/orchestrator.ts';
 import type { PipelineConfig } from '../../pipeline/types.ts';
@@ -36,6 +36,8 @@ export async function pipelineCommand(args:string[]):Promise<void>{
   if(subcommand==='retry'){await pipelineRetryCommand(rest);return;}
   if(subcommand==='dead-letter'){await pipelineDeadLetterCommand(rest);return;}
   if(subcommand==='start'){await pipelineStartCommand(rest);return;}
+  if(subcommand==='reset'){await pipelineResetCommand(rest);return;}
+  if(subcommand==='stage'){await pipelineStageCommand(rest);return;}
   if(subcommand==='stop'){await pipelineStopCommand();return;}
   if(subcommand==='tick'){await pipelineTickCommand(rest);return;}
   if(subcommand==='status'){await pipelineStatusCommand(rest);return;}
@@ -66,5 +68,5 @@ export async function pipelineCommand(args:string[]):Promise<void>{
     let id=String(values.run??'');if(!id){const row=db.prepare('SELECT pipeline_run_id FROM pipeline_runs ORDER BY created_at DESC LIMIT 1').get() as {pipeline_run_id:string}|undefined;id=row?.pipeline_run_id??'';}
     if(!id){db.close();throw new Error('No pipeline runs exist');}const report=stageReport(db,id);db.close();print(report,Boolean(values.json));return;
   }
-  throw new Error('Usage: pipeline <start|stop|tick|status|publish|run|resume|refresh-psa|report|review|terms|failures|retry|dead-letter>');
+  throw new Error('Usage: pipeline <start|reset|stage|stop|tick|status|publish|run|resume|refresh-psa|report|review|terms|failures|retry|dead-letter>');
 }

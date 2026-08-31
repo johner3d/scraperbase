@@ -1,10 +1,14 @@
+import { existsSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { openCliDb } from '../context.ts';
-import { runOneTick, runSupervisor, requestSupervisorStop } from '../../pipeline/supervisor.ts';
+import { retryOnBusy } from '../../core/db/client.ts';
+import { runOneTick, runSupervisor, requestSupervisorStop, STOP_FILE } from '../../pipeline/supervisor.ts';
 import { supervisorStatus } from '../../pipeline/supervisorStatus.ts';
 import { assembleGeneration, publishGeneration, validateGeneration } from '../../pipeline/publication.ts';
 import { syncPipelineGaps } from '../../pipeline/quality.ts';
-import { ensureSupervisorPipelineRun, clearPublishDirty } from '../../pipeline/supervisorState.ts';
+import { ensureSupervisorPipelineRun, clearPublishDirty, getSupervisorState } from '../../pipeline/supervisorState.ts';
+import { resetPipelineToLiveAuctions } from '../../pipeline/reset.ts';
+import { assertSupervisorStage, requestStageRun, setStageAuto } from '../../pipeline/stageControl.ts';
 import { SUPERVISOR_STAGES, type SupervisorStage } from '../../pipeline/stages/types.ts';
 import { materialize } from '../../curated/materialize.ts';
 
@@ -29,6 +33,48 @@ export async function pipelineStartCommand(args: string[]): Promise<void> {
   });
 }
 
+/**
+ * `pipeline reset [--marketplace de] [--query "pikachu psa 10"] [--refresh 30] [--dry-run] [--yes]`
+ * -- narrow the pipeline to the live-auction view: disable non-auction terms,
+ * keep one auction term, drop the PSA target manifest, cancel outstanding
+ * discovery/enrichment work, clear dead-letters. Raw data and the published
+ * site are untouched.
+ */
+export async function pipelineResetCommand(args: string[]): Promise<void> {
+  const { values } = parseArgs({ args, options: {
+    marketplace: { type: 'string', default: 'de' },
+    query: { type: 'string', default: 'pikachu psa 10' },
+    refresh: { type: 'string' },
+    'dry-run': { type: 'boolean', default: false },
+    yes: { type: 'boolean', default: false },
+    json: { type: 'boolean', default: false },
+  } });
+  const dryRun = Boolean(values['dry-run']);
+  const db = openCliDb();
+  try {
+    if (getSupervisorState(db).run_id || existsSync(STOP_FILE)) {
+      throw new Error('The supervisor looks like it is running. Run `pipeline stop` and wait for it to exit first.');
+    }
+    if (!dryRun && !values.yes) {
+      const preview = resetPipelineToLiveAuctions(db, {
+        marketplace: String(values.marketplace), query: String(values.query),
+        refreshIntervalMinutes: values.refresh ? Number(values.refresh) : undefined, dryRun: true,
+      });
+      console.log(JSON.stringify(preview, null, 2));
+      console.log('\nThis will apply the changes above. Re-run with --yes to proceed (or --dry-run to keep inspecting).');
+      return;
+    }
+    const summary = resetPipelineToLiveAuctions(db, {
+      marketplace: String(values.marketplace), query: String(values.query),
+      refreshIntervalMinutes: values.refresh ? Number(values.refresh) : undefined, dryRun,
+    });
+    console.log(JSON.stringify(summary, null, 2));
+    if (!dryRun) console.log('\nDone. Start the narrowed pipeline with: pipeline start');
+  } finally {
+    db.close();
+  }
+}
+
 /** `pipeline stop` -- writes the stop file; the daemon drains and exits. */
 export async function pipelineStopCommand(): Promise<void> {
   requestSupervisorStop();
@@ -45,6 +91,58 @@ export async function pipelineTickCommand(args: string[]): Promise<void> {
   await runOneTick(target as SupervisorStage | 'all');
   const db = openCliDb();
   try { console.log(JSON.stringify(supervisorStatus(db).stages, null, 2)); } finally { db.close(); }
+}
+
+/**
+ * `pipeline stage <list | enable <s> | disable <s> | run <s> [--drain]>`
+ * -- park a stage off the supervisor's auto loop, or poke it on demand, without
+ * restarting the daemon.
+ */
+export async function pipelineStageCommand(args: string[]): Promise<void> {
+  const { positionals, values } = parseArgs({
+    args, allowPositionals: true,
+    options: { drain: { type: 'boolean', default: false }, json: { type: 'boolean', default: false } },
+  });
+  const [sub, stageArg] = positionals;
+  const db = openCliDb();
+  try {
+    if (!sub || sub === 'list') {
+      const status = supervisorStatus(db);
+      if (values.json) { console.log(JSON.stringify(status.stages, null, 2)); return; }
+      console.log(`supervisor: ${status.running ? 'RUNNING' : 'stopped'}\n`);
+      console.log('stage         auto    state        note');
+      for (const s of status.stages) {
+        const auto = s.runRequestedAt ? 'RUN…' : s.autoEnabled ? 'auto' : 'MANUAL';
+        console.log(`${s.stage.padEnd(13)} ${auto.padEnd(7)} ${s.state.padEnd(12)} ${s.note ?? ''}`);
+      }
+      return;
+    }
+    const onWait = (n: number) => console.log(`  supervisor is mid-transaction, waiting… (${n})`);
+    if (sub === 'enable' || sub === 'disable') {
+      const stage = assertSupervisorStage(stageArg ?? '');
+      retryOnBusy(() => setStageAuto(db, stage, sub === 'enable'), { onWait });
+      console.log(`${sub}d auto-run for stage '${stage}'.`);
+      return;
+    }
+    if (sub === 'run') {
+      const stage = assertSupervisorStage(stageArg ?? '');
+      retryOnBusy(() => requestStageRun(db, stage, Boolean(values.drain)), { onWait });
+      const status = supervisorStatus(db);
+      const inActiveSet = status.activeStages == null || status.activeStages.includes(stage);
+      console.log(`Requested a${values.drain ? ' drain' : ' one-shot'} run of stage '${stage}'.`);
+      if (status.running && inActiveSet) {
+        console.log("The running supervisor will run it once the loop next reaches this stage (after any in-progress stage tick finishes).");
+      } else if (status.running && !inActiveSet) {
+        console.log(`WARNING: the supervisor was started with --stages that excludes '${stage}', so it will not run. Restart with '${stage}' included.`);
+      } else {
+        console.log(`The supervisor is not running. Start it (\`pipeline start\`) or run one pass now: \`pipeline tick ${stage}\`.`);
+      }
+      return;
+    }
+    throw new Error('Usage: pipeline stage <list | enable <stage> | disable <stage> | run <stage> [--drain]>');
+  } finally {
+    db.close();
+  }
 }
 
 function fmtAgo(iso: string | null): string {
@@ -73,12 +171,15 @@ export async function pipelineStatusCommand(args: string[]): Promise<void> {
       if (values.watch) process.stdout.write('\x1b[2J\x1b[H');
       console.log(`supervisor: ${status.running ? 'RUNNING' : 'stopped'}${status.runId ? ` (${status.runId})` : ''}  ·  publish ${status.publishDirty ? 'dirty' : 'clean'} (last ${fmtAgo(status.lastPublishAt)})`);
       console.log(`eBay quota: ${status.quota.used}/${status.quota.limit} used  ·  resets ${status.quota.resumeAfter}`);
-      console.log('\nstage         state        queue  inflight  done   dead  thru/min  last activity   note');
+      console.log('\nstage         auto    state        queue  inflight  done   dead  thru/min  last activity   note');
       for (const s of status.stages) {
+        const auto = s.runRequestedAt ? 'RUN…' : s.autoEnabled ? 'auto' : 'MANUAL';
         console.log(
-          `${s.stage.padEnd(13)} ${s.state.padEnd(12)} ${String(s.queueDepth).padStart(5)} ${String(s.inFlight).padStart(9)} ${String(s.doneTotal).padStart(6)} ${String(s.deadLetterOpen).padStart(5)} ${String(s.throughputPerMin).padStart(9)}  ${fmtAgo(s.lastActivityAt).padEnd(14)} ${s.note ?? ''}`,
+          `${s.stage.padEnd(13)} ${auto.padEnd(7)} ${s.state.padEnd(12)} ${String(s.queueDepth).padStart(5)} ${String(s.inFlight).padStart(9)} ${String(s.doneTotal).padStart(6)} ${String(s.deadLetterOpen).padStart(5)} ${String(s.throughputPerMin).padStart(9)}  ${fmtAgo(s.lastActivityAt).padEnd(14)} ${s.note ?? ''}`,
         );
       }
+      const parked = status.stages.filter((s) => !s.autoEnabled).map((s) => s.stage);
+      if (parked.length) console.log(`\nparked (manual only): ${parked.join(', ')}  --  poke with: pipeline stage run <stage> [--drain]`);
       if (status.activePauses.length) {
         console.log('\nPAUSED:');
         for (const p of status.activePauses) console.log(`  [${p.stage}] ${p.reason}`);

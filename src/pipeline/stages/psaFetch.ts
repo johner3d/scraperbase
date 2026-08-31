@@ -20,12 +20,15 @@ import { markPsaSpecDirty } from '../materializeDirty.ts';
 import { markPublishDirty } from '../supervisorState.ts';
 import { recordDeadLetter } from '../deadLetters.ts';
 import { withPsaPage } from './psaBrowser.ts';
+import { LIVE_AUCTION_WINDOW_HOURS } from '../../curated/ebay/liveAuctionScope.ts';
 import type { StageTick } from './types.ts';
 
 const SPECS_PER_TICK = 8;
 const PSA_MAX_AGE_DAYS = Number(process.env.SCRAPERBASE_PSA_MAX_AGE_DAYS) || 7;
 const SALES_AUDIT_DAYS = Number(process.env.SCRAPERBASE_SALES_AUDIT_DAYS) || 30;
 const IDLE_MINUTES = 5;
+/** How long a `no_data` phase rests before we try the fetch again (PSA may have since published a guide). */
+const NO_DATA_RETRY_MINUTES = 90;
 
 /**
  * Fetch PSA population + price + sales facts for the most urgent live targets
@@ -36,8 +39,13 @@ const IDLE_MINUTES = 5;
 export const tickPsaFetch: StageTick = async (db, ctx) => {
   const idle = { nextEligibleAt: new Date(ctx.now().getTime() + IDLE_MINUTES * 60_000).toISOString() };
 
-  // Coverage rows still pending whose target has at least one live listing,
-  // ordered by the soonest auction close. Skip specs with an open dead-letter.
+  // Specs whose target has a listing still in the live auction view (>=1 bid,
+  // ending inside the window) and whose coverage is not yet complete: never
+  // fetched (`pending`/`raw_missing`/`identity_missing`), or last fetched
+  // without a result long enough ago to be worth another try (`no_data`).
+  // Ordered by soonest auction close; specs with an open dead-letter skipped.
+  // The live-listing check mirrors liveAuctionListingClause -- defence in depth
+  // over the already-scoped target manifest.
   const urgent = db.prepare(
     `SELECT DISTINCT t.population_spec_id AS spec, MIN(lp.item_end_date) AS soonest
      FROM pipeline_psa_coverage cov
@@ -45,8 +53,13 @@ export const tickPsaFetch: StageTick = async (db, ctx) => {
      JOIN pipeline_psa_target_listings tl ON tl.pipeline_psa_target_id=t.pipeline_psa_target_id
      JOIN ebay_listings e ON e.ebay_listing_id=tl.ebay_listing_id
      JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id
-     WHERE t.pipeline_run_id=? AND cov.status='pending'
-       AND lp.item_end_date > datetime('now','+15 minutes')
+     WHERE t.pipeline_run_id=?
+       AND (cov.status IN ('pending','raw_missing','identity_missing')
+            OR (cov.status='no_data'
+                AND cov.updated_at < datetime('now', printf('-%d minutes', CAST(? AS INTEGER)))))
+       AND datetime(lp.item_end_date) > datetime('now','+15 minutes')
+       AND datetime(lp.item_end_date) <= datetime('now', printf('+%d hours', CAST(? AS INTEGER)))
+       AND COALESCE(lp.bid_count,0) >= 1
        AND NOT EXISTS (SELECT 1 FROM pipeline_dead_letters d
          WHERE d.stage='psa-fetch' AND d.resolved_at IS NULL
            AND d.scope_key IN ('enrichment:population:spec='||t.population_spec_id,
@@ -54,7 +67,7 @@ export const tickPsaFetch: StageTick = async (db, ctx) => {
      GROUP BY t.population_spec_id
      ORDER BY soonest ASC
      LIMIT ?`,
-  ).all(ctx.pipelineRunId, SPECS_PER_TICK) as Array<{ spec: string; soonest: string }>;
+  ).all(ctx.pipelineRunId, NO_DATA_RETRY_MINUTES, LIVE_AUCTION_WINDOW_HOURS, SPECS_PER_TICK) as Array<{ spec: string; soonest: string }>;
 
   if (urgent.length === 0) {
     return { workDone: 0, note: 'no live PSA targets pending', ...idle };
@@ -64,7 +77,12 @@ export const tickPsaFetch: StageTick = async (db, ctx) => {
   const selections = loadPsaManifest(db, ctx.pipelineRunId).selections.filter((s) => specIds.has(String(s.psaSpecId)));
   if (selections.length === 0) return { workDone: 0, note: 'targets not in manifest yet', ...idle };
 
-  seedPsaEnrichment(db, selections, PSA_MAX_AGE_DAYS, SALES_AUDIT_DAYS);
+  // Every urgent spec is here because its coverage is incomplete, so force a
+  // real re-fetch of exactly these specs rather than trusting a possibly-stale
+  // or wrong-source cached file. `force` also skips the global stale-repend
+  // sweep, which would otherwise drag the whole historical enrichment backlog
+  // back into the queue ahead of the live targets.
+  seedPsaEnrichment(db, selections, PSA_MAX_AGE_DAYS, SALES_AUDIT_DAYS, { force: true });
   indexSalesCheckpoints();
   installStopHandlers();
 

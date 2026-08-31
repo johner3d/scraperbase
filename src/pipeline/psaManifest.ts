@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { OUT_DIR, type Selection } from '../sources/psa/rawFetch.ts';
 import { cardFactsUrl, PSA_BASE } from '../sources/psa/config.ts';
+import { liveAuctionListingClause } from '../curated/ebay/liveAuctionScope.ts';
 
 export interface PsaManifestSummary {
   targets: number;
@@ -71,7 +72,7 @@ function summary(db: DatabaseSync, pipelineRunId: string): PsaManifestSummary {
  * specs halfway through acquisition.
  */
 export function snapshotPsaTargets(db: DatabaseSync, pipelineRunId: string,
-  options:{refresh?:boolean;ebayComplete?:boolean;activeOnly?:boolean;activeMarginMinutes?:number;cap?:number|null}={}): PsaManifestSummary {
+  options:{refresh?:boolean;ebayComplete?:boolean;activeOnly?:boolean;liveAuctionsOnly?:boolean;activeMarginMinutes?:number;cap?:number|null}={}): PsaManifestSummary {
   if (rows(db, pipelineRunId).length && !options.refresh) return summary(db, pipelineRunId);
   const now = new Date().toISOString();
   const latest=db.prepare(`SELECT COALESCE(MAX(manifest_revision),0) revision FROM pipeline_psa_manifest_revisions
@@ -79,30 +80,37 @@ export function snapshotPsaTargets(db: DatabaseSync, pipelineRunId: string,
   const revision=Number(latest.revision)+1;
   const margin = Number.isFinite(options.activeMarginMinutes) ? Number(options.activeMarginMinutes) : 30;
   const cap = options.cap == null ? null : Math.max(1, Math.trunc(options.cap));
-  // When activeOnly, only specs still backed by a live auction become targets,
-  // and the ORDER BY drains soonest-closing first so a `cap` keeps the urgent
-  // specs rather than the oldest ones.
-  const activeClause = options.activeOnly
-    ? `AND lp.item_end_date > datetime('now', printf('+%d minutes', CAST(? AS INTEGER)))`
-    : '';
+  // liveAuctionsOnly: targets are exactly the /auctions dashboard set (see
+  // liveAuctionListingClause). activeOnly: the looser legacy gate -- any spec
+  // still backed by one not-yet-ended matched listing. Both order soonest-close
+  // first so a `cap` keeps the urgent specs.
+  const live = Boolean(options.liveAuctionsOnly);
+  const liveClause = live ? liveAuctionListingClause('e', 'lp', { marginMinutes: margin }) : null;
+  const legacyActive = options.activeOnly && !live;
+  const listingWhere = liveClause
+    ? liveClause.sql
+    : `e.variant_id IS NOT NULL AND e.match_status IN ('matched','manual')
+       AND e.match_tier IN ('exact','strong') AND e.flagged=0
+       AND (e.match_method IS NULL OR e.match_method<>'ebay-cluster-propagate')
+       ${legacyActive ? `AND datetime(lp.item_end_date) > datetime('now', printf('+%d minutes', CAST(? AS INTEGER)))` : ''}`;
+  const priceJoin = liveClause ? liveClause.join
+    : `LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id`;
   const candidateParams: number[] = [];
-  if (options.activeOnly) candidateParams.push(margin);
+  if (liveClause) candidateParams.push(...liveClause.params);
+  else if (legacyActive) candidateParams.push(margin);
   if (cap != null) candidateParams.push(cap);
   const candidates = db.prepare(`SELECT ps.spec_id population_spec_id,ps.spec_id sales_spec_id,
       v.variant_id,s.source_set_id,s.source_set_id||'-'||c.local_id source_card_id,
       COALESCE(v.finish,'unknown') finish,COALESCE(v.print_run_marker,'unknown') print_run_marker,v.micro_variant,
-      MIN(CASE WHEN lp.item_end_date > datetime('now') THEN lp.item_end_date END) next_future_end
+      MIN(CASE WHEN datetime(lp.item_end_date) > datetime('now') THEN lp.item_end_date END) next_future_end
     FROM ebay_listings e
     JOIN variants v ON v.variant_id=e.variant_id
     JOIN cards c ON c.card_id=v.card_id
     JOIN sets s ON s.set_id=c.set_id
     JOIN psa_specs ps ON ps.variant_id=v.variant_id AND ps.namespace='population'
       AND ps.match_status IN ('matched','manual')
-    LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id
-    WHERE e.variant_id IS NOT NULL AND e.match_status IN ('matched','manual')
-      AND e.match_tier IN ('exact','strong') AND e.flagged=0
-      AND (e.match_method IS NULL OR e.match_method<>'ebay-cluster-propagate')
-      ${activeClause}
+    ${priceJoin}
+    WHERE ${listingWhere}
     GROUP BY ps.spec_id,v.variant_id
     ORDER BY (next_future_end IS NULL) ASC, next_future_end ASC,
       s.release_date,s.source_set_id,c.local_sort_key,ps.spec_id,v.variant_id
@@ -115,9 +123,13 @@ export function snapshotPsaTargets(db: DatabaseSync, pipelineRunId: string,
   const insert = db.prepare(`INSERT INTO pipeline_psa_targets
     (pipeline_run_id,population_spec_id,sales_spec_id,variant_id,source_set_id,source_card_id,
      finish,print_run_marker,micro_variant,created_at,manifest_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING pipeline_psa_target_id`);
-  const listingQuery = db.prepare(`SELECT ebay_listing_id FROM ebay_listings WHERE variant_id=?
-    AND match_status IN ('matched','manual') AND match_tier IN ('exact','strong') AND flagged=0
-    AND (match_method IS NULL OR match_method<>'ebay-cluster-propagate')`);
+  const listingQuery = liveClause
+    ? db.prepare(`SELECT e.ebay_listing_id FROM ebay_listings e ${liveClause.join}
+        WHERE e.variant_id=? AND ${liveClause.sql}`)
+    : db.prepare(`SELECT ebay_listing_id FROM ebay_listings WHERE variant_id=?
+        AND match_status IN ('matched','manual') AND match_tier IN ('exact','strong') AND flagged=0
+        AND (match_method IS NULL OR match_method<>'ebay-cluster-propagate')`);
+  const listingParams = liveClause ? liveClause.params : [];
   const insertListing = db.prepare(`INSERT OR IGNORE INTO pipeline_psa_target_listings
     (pipeline_psa_target_id,ebay_listing_id) VALUES(?,?)`);
   const insertCoverage = db.prepare(`INSERT INTO pipeline_psa_coverage
@@ -135,7 +147,7 @@ export function snapshotPsaTargets(db: DatabaseSync, pipelineRunId: string,
         newTargets++;
         for (const phase of ['population','guide','sales']) insertCoverage.run(result.pipeline_psa_target_id,phase,now);
       }
-      for (const listing of listingQuery.all(candidate.variant_id) as unknown as Array<{ebay_listing_id:number}>) {
+      for (const listing of listingQuery.all(candidate.variant_id, ...listingParams) as unknown as Array<{ebay_listing_id:number}>) {
         insertListing.run(result.pipeline_psa_target_id, listing.ebay_listing_id);
       }
     }

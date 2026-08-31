@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { Selection } from '../sources/psa/rawFetch.ts';
 import { cardFactsUrl, PSA_BASE } from '../sources/psa/config.ts';
+import { liveAuctionListingClause } from './ebay/liveAuctionScope.ts';
 
 /**
  * PSA fetch targets derived from the eBay match table.
@@ -25,7 +26,12 @@ export interface MatchedTargetOptions {
   tiers?: readonly string[];
   /** Drop listings the matcher accepted but flagged for a human glance. */
   excludeFlagged?: boolean;
-  /** The /auctions dashboard slice: trusted tiers, PSA 10, single cards. */
+  /**
+   * The /auctions dashboard slice, exactly: trusted tiers, PSA 10, single
+   * cards, not flagged/lot, an AUCTION listing with >=1 bid, still active and
+   * ending inside the live window. See `liveAuctionListingClause`. Implies its
+   * own active filter, so `activeOnly` is redundant with it.
+   */
   liveAuctionsOnly?: boolean;
   /** Cap applied to the deduplicated, ordered spec list. */
   limit?: number | null;
@@ -79,32 +85,40 @@ interface SpecRow {
  * Shared by both halves of the query so the fetchable set and the unresolved
  * set are always complements of one another rather than two drifting filters.
  */
-function listingClauses(options: MatchedTargetOptions): { sql: string; params: string[] } {
+function listingClauses(options: MatchedTargetOptions): { sql: string; params: Array<string | number>; join: string } {
+  if (options.liveAuctionsOnly) {
+    const clause = liveAuctionListingClause('e', 'lp',
+      Number.isFinite(options.activeMarginMinutes) ? { marginMinutes: Number(options.activeMarginMinutes) } : {});
+    return { sql: clause.sql, params: [...clause.params], join: clause.join };
+  }
   const clauses = [`e.variant_id IS NOT NULL`, `e.match_status IN ('matched', 'manual')`];
   const params: string[] = [];
-  const tiers = options.liveAuctionsOnly ? ['exact', 'strong'] : (options.tiers ?? ['exact', 'strong']);
+  const tiers = options.tiers ?? ['exact', 'strong'];
   if (tiers && tiers.length > 0) {
     clauses.push(`e.match_tier IN (${tiers.map(() => '?').join(', ')})`);
     params.push(...tiers);
   }
   // Flagged and cluster-propagated matches are never production targets.
   clauses.push(`e.flagged = 0`, `(e.match_method IS NULL OR e.match_method <> 'ebay-cluster-propagate')`);
-  if (options.liveAuctionsOnly) clauses.push(`e.is_lot = 0`, `e.grade_value = 10`);
-  return { sql: clauses.join(' AND '), params };
+  return { sql: clauses.join(' AND '), params, join: '' };
 }
 
 export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTargetOptions = {}): MatchedTargets {
-  const { sql: where, params } = listingClauses(options);
+  const { sql: where, params, join } = listingClauses(options);
+  const live = Boolean(options.liveAuctionsOnly);
   const margin = Number.isFinite(options.activeMarginMinutes) ? Number(options.activeMarginMinutes) : 30;
+  // The live clause carries its own active window; the legacy activeOnly path
+  // bolts a margin-bound `item_end_date` check onto an otherwise-unfiltered set.
+  const legacyActive = options.activeOnly && !live;
   // `?`-bound so the margin can't inject SQL; consumed once per query it appears in.
-  const activeExpr = `lp.item_end_date > datetime('now', printf('+%d minutes', CAST(? AS INTEGER)))`;
-  const havingActive = options.activeOnly ? `HAVING MAX(CASE WHEN ${activeExpr} THEN 1 ELSE 0 END) = 1` : '';
-  const specParams = options.activeOnly ? [...params, margin] : params;
-  const unresolvedActiveJoin = options.activeOnly
-    ? 'LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id = e.ebay_listing_id'
-    : '';
-  const unresolvedActiveClause = options.activeOnly ? `AND ${activeExpr}` : '';
-  const unresolvedParams = options.activeOnly ? [...params, margin] : params;
+  const activeExpr = `datetime(lp.item_end_date) > datetime('now', printf('+%d minutes', CAST(? AS INTEGER)))`;
+  const havingActive = legacyActive ? `HAVING MAX(CASE WHEN ${activeExpr} THEN 1 ELSE 0 END) = 1` : '';
+  const priceJoin = live ? join : 'LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id = e.ebay_listing_id';
+  const specParams = legacyActive ? [...params, margin] : params;
+  const unresolvedJoin = live ? join
+    : legacyActive ? 'LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id = e.ebay_listing_id' : '';
+  const unresolvedActiveClause = legacyActive ? `AND ${activeExpr}` : '';
+  const unresolvedParams = legacyActive ? [...params, margin] : params;
 
   // GROUP BY ps.spec_id is the deduplication: 2,746 matched listings collapse
   // to one fetch per spec. COUNT(DISTINCT ...) reports what is behind them.
@@ -122,13 +136,13 @@ export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTarge
       v.micro_variant AS microVariant, ps.spec_id AS specId,
       v.variant_id AS variantId,
       COUNT(DISTINCT e.ebay_listing_id) AS listings,
-      MIN(CASE WHEN lp.item_end_date > datetime('now') THEN lp.item_end_date END) AS nextFutureEnd
+      MIN(CASE WHEN datetime(lp.item_end_date) > datetime('now') THEN lp.item_end_date END) AS nextFutureEnd
     FROM ebay_listings e
     JOIN psa_specs ps ON ps.variant_id = e.variant_id AND ps.namespace = 'population'
     JOIN variants v ON v.variant_id = ps.variant_id
     JOIN cards c ON c.card_id = v.card_id
     JOIN sets s ON s.set_id = c.set_id
-    LEFT JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id = e.ebay_listing_id
+    ${priceJoin}
     WHERE ${where}
     GROUP BY ps.spec_id
     ${havingActive}
@@ -142,7 +156,7 @@ export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTarge
     JOIN variants v ON v.variant_id = e.variant_id
     JOIN cards c ON c.card_id = v.card_id
     JOIN sets s ON s.set_id = c.set_id
-    ${unresolvedActiveJoin}
+    ${unresolvedJoin}
     WHERE ${where}
       ${unresolvedActiveClause}
       AND NOT EXISTS (
@@ -183,6 +197,7 @@ export function selectEbayMatchedTargets(db: DatabaseSync, options: MatchedTarge
   const variantCount = variantIds.length;
   const listingCount = variantIds.length === 0 ? 0 : Number((db.prepare(`
     SELECT COUNT(DISTINCT e.ebay_listing_id) AS n FROM ebay_listings e
+    ${live ? join : ''}
     WHERE ${where} AND e.variant_id IN (${variantIds.map(() => '?').join(', ')})
   `).get(...params, ...variantIds) as { n: number }).n);
 

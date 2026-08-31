@@ -17,7 +17,7 @@ function pendingCertCount(db: Parameters<StageTick>[0]): number {
 
 /** Resolve PSA cert numbers found on eBay listings back to the spec PSA graded. */
 export const tickPsaCert: StageTick = async (db, ctx) => {
-  seedPsaCertLookups(db);
+  seedPsaCertLookups(db, 5000, true);
   if (pendingCertCount(db) === 0) {
     return { workDone: 0, note: 'no cert lookups pending', nextEligibleAt: new Date(ctx.now().getTime() + 3 * 60_000).toISOString() };
   }

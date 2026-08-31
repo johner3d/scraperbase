@@ -57,8 +57,18 @@ interface ListingOptions {
   isLot?: 0 | 1;
   grade?: number | null;
   status?: string;
+  matchMethod?: string;
   /** ISO end date for the listing's latest price observation, if any. */
   itemEndDate?: string;
+  /** Latest-observation bid count (default 1 when a price observation is written). */
+  bidCount?: number;
+  /** Latest-observation buying options JSON (default '["AUCTION"]'). */
+  buyingOptions?: string;
+}
+
+/** ISO string `hours` from now -- for live-window assertions independent of the wall clock. */
+export function hoursFromNow(hours: number): string {
+  return new Date(Date.now() + hours * 3_600_000).toISOString();
 }
 
 let listingSeq = 0;
@@ -71,17 +81,19 @@ function seedListing(db: Db, variantId: number | null, options: ListingOptions =
   ).get(itemId, NOW, NOW) as { source_record_id: number };
   const listing = db.prepare(
     `INSERT INTO ebay_listings (source_record_id, marketplace, item_id, title, variant_id, match_status, match_tier,
-       flagged, is_lot, grade_value, first_seen_at, last_seen_at)
-     VALUES (?, 'EBAY_US', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ebay_listing_id`,
+       match_method, flagged, is_lot, grade_value, first_seen_at, last_seen_at)
+     VALUES (?, 'EBAY_US', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ebay_listing_id`,
   ).get(
     record.source_record_id, itemId, `Listing ${itemId}`, variantId, options.status ?? 'matched', options.tier ?? 'strong',
-    options.flagged ?? 0, options.isLot ?? 0, options.grade === undefined ? 10 : options.grade, NOW, NOW,
+    options.matchMethod ?? null, options.flagged ?? 0, options.isLot ?? 0, options.grade === undefined ? 10 : options.grade, NOW, NOW,
   ) as { ebay_listing_id: number };
   if (options.itemEndDate) {
     db.prepare(
-      `INSERT INTO ebay_listing_price_observations (ebay_listing_id, observed_at, item_end_date, buying_options_json, snapshot_fingerprint)
-       VALUES (?, ?, ?, '[]', ?)`,
-    ).run(listing.ebay_listing_id, NOW, options.itemEndDate, `fp-${listing.ebay_listing_id}`);
+      `INSERT INTO ebay_listing_price_observations
+         (ebay_listing_id, observed_at, item_end_date, bid_count, buying_options_json, snapshot_fingerprint)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(listing.ebay_listing_id, NOW, options.itemEndDate, options.bidCount ?? 1,
+      options.buyingOptions ?? '["AUCTION"]', `fp-${listing.ebay_listing_id}`);
   }
   return listing.ebay_listing_id;
 }
@@ -159,11 +171,48 @@ test('tier, flagged and live-auction filters narrow the target list', async () =
       selectEbayMatchedTargets(db, { excludeFlagged: true }).selections.map((s) => s.psaSpecId),
       [600001, 600003],
     );
-    // live auctions = trusted tier + unflagged + single card + PSA 10
-    assert.deepEqual(
-      selectEbayMatchedTargets(db, { liveAuctionsOnly: true }).selections.map((s) => s.psaSpecId),
-      [600001],
-    );
+  });
+});
+
+test('liveAuctionsOnly keeps exactly the /auctions dashboard slice', async () => {
+  await withDb((db) => {
+    // Qualifies: trusted, PSA 10, single, >=1 bid, ends in 24h.
+    const live = seedVariant(db, 'base1', '1999-01-09', '4');
+    seedSpec(db, live, '600001');
+    seedListing(db, live, { tier: 'strong', itemEndDate: hoursFromNow(24), bidCount: 2 });
+
+    // Zero bids -- not on the dashboard.
+    const noBids = seedVariant(db, 'base1', '1999-01-09', '9');
+    seedSpec(db, noBids, '600002');
+    seedListing(db, noBids, { itemEndDate: hoursFromNow(24), bidCount: 0 });
+
+    // Ends well outside the 72h window.
+    const farOut = seedVariant(db, 'base1', '1999-01-09', '15');
+    seedSpec(db, farOut, '600003');
+    seedListing(db, farOut, { itemEndDate: hoursFromNow(24 * 10), bidCount: 5 });
+
+    // Fixed-price, not an auction.
+    const fixed = seedVariant(db, 'base1', '1999-01-09', '25');
+    seedSpec(db, fixed, '600004');
+    seedListing(db, fixed, { itemEndDate: hoursFromNow(24), bidCount: 1, buyingOptions: '["FIXED_PRICE"]' });
+
+    // Already ended.
+    const ended = seedVariant(db, 'base1', '1999-01-09', '58');
+    seedSpec(db, ended, '600005');
+    seedListing(db, ended, { itemEndDate: hoursFromNow(-2), bidCount: 3 });
+
+    // Lot, and a cluster-propagated match -- both excluded.
+    const lot = seedVariant(db, 'base1', '1999-01-09', '77');
+    seedSpec(db, lot, '600006');
+    seedListing(db, lot, { isLot: 1, itemEndDate: hoursFromNow(24), bidCount: 3 });
+    const propagated = seedVariant(db, 'base1', '1999-01-09', '99');
+    seedSpec(db, propagated, '600007');
+    seedListing(db, propagated, { matchMethod: 'ebay-cluster-propagate', itemEndDate: hoursFromNow(24), bidCount: 3 });
+
+    const targets = selectEbayMatchedTargets(db, { liveAuctionsOnly: true });
+    assert.deepEqual(targets.selections.map((s) => s.psaSpecId), [600001]);
+    assert.equal(targets.listingCount, 1);
+    assert.equal(targets.unresolvedVariants, 0);
   });
 });
 
@@ -239,6 +288,28 @@ test('snapshotPsaTargets with activeOnly writes no target for an all-ended varia
     });
     const legacy = snapshotPsaTargets(db, legacyRun);
     assert.deepEqual(legacy.selections.map((s) => s.psaSpecId).sort(), [600001, 600002]);
+  });
+});
+
+test('snapshotPsaTargets with liveAuctionsOnly freezes only dashboard-visible targets and listings', async () => {
+  await withDb((db) => {
+    const live = seedVariant(db, 'base1', '1999-01-09', '4');
+    seedSpec(db, live, '600001');
+    seedListing(db, live, { tier: 'strong', itemEndDate: hoursFromNow(12), bidCount: 2 });
+    // A second listing on the same variant that is NOT live -- must not be attached.
+    seedListing(db, live, { tier: 'strong', itemEndDate: hoursFromNow(12), bidCount: 0 });
+
+    const noBids = seedVariant(db, 'base1', '1999-01-09', '15');
+    seedSpec(db, noBids, '600002');
+    seedListing(db, noBids, { itemEndDate: hoursFromNow(12), bidCount: 0 });
+
+    const runId = createPipelineRun(db, {
+      queries: ['pikachu psa 10'], marketplaces: ['de'], maxItems: 0, pageLimit: 200,
+      concurrency: 1, psaMaxAgeDays: 7, salesAuditDays: 30, allSales: true,
+    });
+    const snapshot = snapshotPsaTargets(db, runId, { liveAuctionsOnly: true });
+    assert.deepEqual(snapshot.selections.map((s) => s.psaSpecId), [600001]);
+    assert.equal(snapshot.listings, 1);
   });
 });
 

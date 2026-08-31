@@ -18,7 +18,7 @@ export const tickReconcile: StageTick = async (db, ctx) => {
   // Everything just got rebuilt, so the incremental dirty sets are stale.
   clearDirty(db, 'ebay-item', peekDirty(db, 'ebay-item', 100_000), at);
   clearDirty(db, 'psa-spec', peekDirty(db, 'psa-spec', 100_000), at);
-  const manifest = snapshotPsaTargets(db, ctx.pipelineRunId, { refresh: true, activeOnly: true, cap: PSA_TARGET_CAP, ebayComplete: true });
+  const manifest = snapshotPsaTargets(db, ctx.pipelineRunId, { refresh: true, liveAuctionsOnly: true, cap: PSA_TARGET_CAP, ebayComplete: true });
   syncPsaCoverage(db, ctx.pipelineRunId);
   markPublishDirty(db);
   ctx.log(`reconcile: full rebuild (${result.ebayListings} listings, ${result.psaSpecs} specs, ${manifest.specs} live targets)`);

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 15;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -15,9 +15,35 @@ export function openDb(dbPath: string): DatabaseSync {
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
-  db.exec('PRAGMA busy_timeout = 10000');
+  // Generous so a short CLI write (e.g. `pipeline stage …`) waits out a
+  // daemon tick's transaction instead of erroring with "database is locked".
+  db.exec('PRAGMA busy_timeout = 30000');
   migrate(db);
   return db;
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms));
+}
+
+/**
+ * Retry `fn` while SQLite reports the database is locked. The daemon's daily
+ * full `materialize` holds one long write transaction; a control-plane CLI write
+ * (e.g. `pipeline stage …`) needs to wait it out rather than error.
+ */
+export function retryOnBusy<T>(fn: () => T, opts: { attempts?: number; delayMs?: number; onWait?: (attempt: number) => void } = {}): T {
+  const attempts = opts.attempts ?? 6;
+  const delayMs = opts.delayMs ?? 3000;
+  for (let i = 1; ; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (i >= attempts || !/database is locked|SQLITE_BUSY/i.test(msg)) throw err;
+      opts.onWait?.(i);
+      sleepSync(delayMs);
+    }
+  }
 }
 
 /** Runs `fn` inside a BEGIN IMMEDIATE/COMMIT block, rolling back on any throw. */
@@ -99,5 +125,15 @@ function migrate(db: DatabaseSync): void {
   if (version < 13) {
     db.exec(readFileSync(path.join(__dirname, 'schema_v13.sql'), 'utf8'));
     db.exec('PRAGMA user_version = 13');
+    version = 13;
+  }
+  if (version < 14) {
+    db.exec(readFileSync(path.join(__dirname, 'schema_v14.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 14');
+    version = 14;
+  }
+  if (version < 15) {
+    db.exec(readFileSync(path.join(__dirname, 'schema_v15.sql'), 'utf8'));
+    db.exec('PRAGMA user_version = 15');
   }
 }

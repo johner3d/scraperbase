@@ -346,6 +346,10 @@ export interface StageStatusView {
   lastActivityAt:string|null;
   nextEligibleAt:string|null;
   note:string|null;
+  /** false = parked off the supervisor's auto loop (`pipeline stage disable`). */
+  autoEnabled:boolean;
+  /** set while a `pipeline stage run` poke is pending/in progress. */
+  runRequestedAt:string|null;
 }
 
 export interface TermFunnelView {
@@ -367,6 +371,8 @@ export interface SupervisorStatusView {
   lastPublishAt:string|null;
   quota:{used:number;limit:number;allowance:number;resumeAfter:string;paused:boolean};
   stages:StageStatusView[];
+  /** Stage set the running daemon was started with (`--stages`); null = all. */
+  activeStages:string[]|null;
   terms:TermFunnelView[];
   deadLetters:Array<{stage:string;scopeKey:string;reason:string;lastSeenAt:string}>;
   activePauses:Array<{stage:string;source:string;reason:string;resumeAfter:string|null}>;

@@ -75,22 +75,29 @@ export interface LiveAuctionSelection {
 
 /**
  * Pure filtering for --live-auctions mode: keep only items with at least
- * `minBidCount` bids whose end date is before `endingBeforeAt`, using only
- * the bidCount/itemEndDate fields eBay's search response already includes
- * for free (no item-detail call needed to make this decision). Assumes the
- * caller requested `sort=endingSoonest`, so the first out-of-window item
- * ends the scan for the whole page.
+ * `minBidCount` bids whose end date is in the future but before
+ * `endingBeforeAt`, using only the bidCount/itemEndDate fields eBay's search
+ * response already includes for free (no item-detail call needed to make this
+ * decision). Assumes the caller requested `sort=endingSoonest`, so the first
+ * out-of-window item ends the scan for the whole page.
+ *
+ * The `now` lower bound is a backstop: eBay's active search should never
+ * return an already-ended auction, but if one slips through we must not spend
+ * an item-detail call on it -- PSA facts and bid snapshots are only useful
+ * while a listing is still sellable.
  */
 export function selectLiveAuctionItems(
   summaries: ItemSummaryBrief[],
-  opts: { minBidCount: number; endingBeforeAt?: string },
+  opts: { minBidCount: number; endingBeforeAt?: string; now?: string },
 ): LiveAuctionSelection {
+  const now = opts.now ?? new Date().toISOString();
   const itemIds: string[] = [];
   for (const summary of summaries) {
     if (typeof summary.itemId !== 'string' || summary.itemId.length === 0) continue;
     if (opts.endingBeforeAt && summary.itemEndDate && summary.itemEndDate >= opts.endingBeforeAt) {
       return { itemIds, pastCutoff: true };
     }
+    if (summary.itemEndDate && summary.itemEndDate <= now) continue;
     if ((summary.bidCount ?? 0) < opts.minBidCount) continue;
     itemIds.push(summary.itemId);
   }
@@ -232,8 +239,9 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
     }
 
     const liveAuctions = params.mode === 'live_auctions';
+    const nowIso = new Date().toISOString();
     const selection = liveAuctions
-      ? selectLiveAuctionItems(parsed.itemSummaries ?? [], { minBidCount: params.minBidCount ?? 0, endingBeforeAt: params.endingBeforeAt })
+      ? selectLiveAuctionItems(parsed.itemSummaries ?? [], { minBidCount: params.minBidCount ?? 0, endingBeforeAt: params.endingBeforeAt, now: nowIso })
       : { itemIds: (parsed.itemSummaries ?? []).map((s) => s.itemId).filter((id): id is string => typeof id === 'string' && id.length > 0), pastCutoff: false };
     const pastCutoff = selection.pastCutoff;
 
@@ -252,10 +260,18 @@ export function createEbaySearchCollector(deps: SearchDeps): Collector {
     // produce another append-only price observation. New IDs are still
     // inserted normally by enqueueNext below.
     if (liveAuctions || (params.campaignId && params.refreshDetails!==false && params.refreshDetails!==0)) {
-      const now = new Date().toISOString();
+      // Backstop: never re-arm a listing we already know has ended -- its
+      // bid/end state is final, so another item-detail call just burns quota.
+      const ended = new Set((db.prepare(`SELECT e.item_id FROM ebay_listings e
+        JOIN v_ebay_listing_latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id
+        WHERE e.marketplace=? AND lp.item_end_date IS NOT NULL AND lp.item_end_date<=?`)
+        .all(params.marketplace, nowIso) as Array<{ item_id: string }>).map((r) => String(r.item_id)));
       const reset = db.prepare(`UPDATE work_items SET state='pending',attempts=0,available_at=?,last_error=NULL,
         lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE work_item_id=? AND state='succeeded'`);
-      for (const itemId of selection.itemIds) reset.run(now, now, workItemId('ebay','ebay_item_detail',itemScopeKey(params.marketplace,itemId)));
+      for (const itemId of selection.itemIds) {
+        if (ended.has(itemId)) continue;
+        reset.run(nowIso, nowIso, workItemId('ebay','ebay_item_detail',itemScopeKey(params.marketplace,itemId)));
+      }
     }
 
     const enqueueNext: EnqueueSpec[] = selection.itemIds.map((itemId) => ({

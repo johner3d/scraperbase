@@ -7,6 +7,7 @@ import { createRun, finishRun } from '../core/queue/run.ts';
 import { sweepQueue } from '../core/queue/scheduler.ts';
 import { logEvent } from '../core/events/eventLog.ts';
 import { recordStageActivity, type StageState } from './stageState.ts';
+import { clearStageRun, readStageControl, stageTickDecision } from './stageControl.ts';
 import { beginSupervisor, endSupervisor, ensureSupervisorPipelineRun, getSupervisorState } from './supervisorState.ts';
 import { SUPERVISOR_STAGES, type StageContext, type StageTick, type StageTickResult, type SupervisorStage } from './stages/types.ts';
 import { tickIngest } from './stages/ingest.ts';
@@ -32,6 +33,8 @@ const REGISTRY: Record<SupervisorStage, { tick: StageTick; maxTickMs: number }> 
 
 const BACKOFF_LADDER_MS = [5_000, 15_000, 60_000, 120_000];
 const LOOP_FLOOR_MS = Number(process.env.SCRAPERBASE_SUPERVISOR_LOOP_MS) || 750;
+/** Safety cap on how many ticks one `pipeline stage run --drain` poke may run. */
+const MANUAL_DRAIN_MAX = 200;
 
 function timeoutRace<T>(promise: Promise<T>, ms: number): Promise<T | { __timedOut: true }> {
   return Promise.race([promise, new Promise<{ __timedOut: true }>((resolve) => setTimeout(() => resolve({ __timedOut: true }), ms))]);
@@ -92,6 +95,7 @@ export async function runSupervisor(dbInput: DatabaseSync | null, opts: Supervis
 
   const backoffIndex = new Map<SupervisorStage, number>();
   const nextAt = new Map<SupervisorStage, number>();
+  const manualDrainCount = new Map<SupervisorStage, number>();
 
   const ctxFor = (): StageContext => ({
     runId, pipelineRunId,
@@ -111,7 +115,12 @@ export async function runSupervisor(dbInput: DatabaseSync | null, opts: Supervis
       for (const stage of stages) {
         if (draining) break;
         const now = Date.now();
-        if ((nextAt.get(stage) ?? 0) > now) continue;
+        // `pipeline tick` is an explicit one-shot -- it ignores the park flag and
+        // backoff and runs every requested stage once.
+        const decision = opts.once
+          ? { tick: true, manual: false, drain: false }
+          : stageTickDecision(readStageControl(db, stage), nextAt.get(stage) ?? 0, now);
+        if (!decision.tick) continue;
 
         db.prepare(`UPDATE pipeline_stage_status SET state='working', last_tick_at=? WHERE stage=?`)
           .run(new Date().toISOString(), stage);
@@ -160,6 +169,21 @@ export async function runSupervisor(dbInput: DatabaseSync | null, opts: Supervis
         }
 
         recordStageActivity(db, stage, result, state);
+
+        // Resolve a manual `pipeline stage run` poke: keep re-ticking only while
+        // it asked to drain and there is still work, otherwise clear the request
+        // so a parked stage goes back to sleep.
+        if (decision.manual) {
+          const drained = manualDrainCount.get(stage) ?? 0;
+          if (decision.drain && result.workDone > 0 && !result.pause && drained + 1 < MANUAL_DRAIN_MAX && !draining) {
+            manualDrainCount.set(stage, drained + 1);
+            nextAt.set(stage, Date.now() + 1_000);
+            didWork = true;
+          } else {
+            clearStageRun(db, stage);
+            manualDrainCount.delete(stage);
+          }
+        }
       }
 
       if (opts.once) break;

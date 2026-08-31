@@ -6,6 +6,7 @@ import { classifyHttpStatus } from '../../../core/http/fetchClient.ts';
 import type { RateLimiter } from '../../../core/http/rateLimiter.ts';
 import { PSA_BASE } from '../config.ts';
 import { certScopeKey } from '../scopeKeys.ts';
+import { liveAuctionListingClause } from '../../../curated/ebay/liveAuctionScope.ts';
 
 const CERT_EVALUATE_TIMEOUT_MS=30_000;
 
@@ -47,12 +48,23 @@ export function certLookupUrl(certNumber: string): string {
  * listing that is not already resolved. Cert numbers repeat across relistings
  * of the same slab, so the queue is keyed on the number rather than on the
  * listing.
+ *
+ * `liveOnly` restricts the seed to listings currently in the /auctions live
+ * auction view (see `liveAuctionListingClause`) -- the supervisor pipeline only
+ * cares about certs on cards a user can actually see.
  */
-export function seedPsaCertLookups(db: DatabaseSync, limit = 5000): number {
-  const rows = db.prepare(`SELECT DISTINCT cert_number FROM ebay_listings
-    WHERE cert_number IS NOT NULL AND TRIM(cert_number) <> ''
-      AND match_method IS NOT 'ebay-psa-cert'
-    LIMIT ?`).all(limit) as unknown as Array<{ cert_number: string }>;
+export function seedPsaCertLookups(db: DatabaseSync, limit = 5000, liveOnly = false): number {
+  const live = liveOnly ? liveAuctionListingClause('e', 'lp') : null;
+  const rows = db.prepare(live
+    ? `SELECT DISTINCT e.cert_number AS cert_number FROM ebay_listings e ${live.join}
+       WHERE e.cert_number IS NOT NULL AND TRIM(e.cert_number) <> ''
+         AND e.match_method IS NOT 'ebay-psa-cert' AND ${live.sql}
+       LIMIT ?`
+    : `SELECT DISTINCT cert_number FROM ebay_listings
+       WHERE cert_number IS NOT NULL AND TRIM(cert_number) <> ''
+         AND match_method IS NOT 'ebay-psa-cert'
+       LIMIT ?`,
+  ).all(...(live ? [...live.params, limit] : [limit])) as unknown as Array<{ cert_number: string }>;
   let seeded = 0;
   for (const row of rows) {
     const certNumber = row.cert_number.trim();
