@@ -81,17 +81,50 @@ function rangeClauses(search: URLSearchParams): { sql: string[]; params: SqlValu
 function variantMetricsCte(idFilter?: { sql: string; params: SqlValue[] }): { sql: string; params: SqlValue[] } {
   const cutoff = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
   const extra = idFilter ? ` AND ${idFilter.sql}` : '';
-  const sql = `latest_pop AS (SELECT *,ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY fetched_at DESC,psa_spec_pk DESC) rn
-      FROM psa_specs WHERE namespace='population' AND match_status IN ('matched','manual')${extra}),
+  // PSA specs and eBay listings routinely land on *different* catalogue rows for
+  // the same physical card: tcgdex contributes one variant and PSA's own
+  // pop-report contributes another for the same finish. Resolving metrics only
+  // by exact variant_id therefore hides numbers we already hold. Each spec is
+  // expanded across its card's variants, ranked so the spec's own variant wins,
+  // then a same-finish/micro sibling, then any sibling -- and, at equal
+  // affinity, a spec that actually carries rows beats an empty newer one.
+  const sql = `pop_spec_variant AS (SELECT * FROM (
+        SELECT ps.psa_spec_pk AS psa_spec_pk, sv.variant_id AS variant_id, ps.fetched_at AS fetched_at,
+          CASE WHEN sv.variant_id=ps.variant_id THEN 0
+               WHEN COALESCE(sv.finish,'')=COALESCE(ps.finish,'')
+                    AND COALESCE(sv.micro_variant,'')=COALESCE(ps.micro_variant,'') THEN 1
+               ELSE 2 END AS affinity
+        FROM psa_specs ps
+        JOIN variants pv ON pv.variant_id=ps.variant_id
+        JOIN variants sv ON sv.card_id=pv.card_id
+        WHERE ps.namespace='population' AND ps.match_status IN ('matched','manual'))
+      WHERE 1=1${extra}),
+    latest_pop AS (SELECT psa_spec_pk,variant_id,affinity,
+      ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY affinity ASC,
+        EXISTS(SELECT 1 FROM psa_population_current p WHERE p.population_spec_pk=psa_spec_pk) DESC,
+        fetched_at DESC,psa_spec_pk DESC) rn
+      FROM pop_spec_variant),
     pop AS (SELECT lp.variant_id,MAX(p.total_population) total_graded,
       SUM(CASE WHEN p.grade_value=10 AND p.qualified=0 THEN p.population_count ELSE 0 END) psa10_population
       FROM latest_pop lp JOIN psa_population_current p ON p.population_spec_pk=lp.psa_spec_pk WHERE lp.rn=1 GROUP BY lp.variant_id),
     price AS (SELECT lp.variant_id,pc.psa_price latest_psa10_price,pc.average_price avg_psa10_price
       FROM latest_pop lp JOIN psa_price_current pc ON pc.population_spec_pk=lp.psa_spec_pk WHERE lp.rn=1 AND pc.grade_value=10),
-    latest_sales_spec AS (SELECT ps.*,ROW_NUMBER() OVER(PARTITION BY ps.variant_id ORDER BY
-      EXISTS(SELECT 1 FROM psa_sales s WHERE s.sales_spec_pk=ps.psa_spec_pk) DESC,
-      ps.fetched_at DESC,ps.psa_spec_pk DESC) rn
-      FROM psa_specs ps WHERE ps.namespace='sales' AND ps.match_status IN ('matched','manual')${extra}),
+    sales_spec_variant AS (SELECT * FROM (
+        SELECT ps.psa_spec_pk AS psa_spec_pk, sv.variant_id AS variant_id, ps.fetched_at AS fetched_at,
+          CASE WHEN sv.variant_id=ps.variant_id THEN 0
+               WHEN COALESCE(sv.finish,'')=COALESCE(ps.finish,'')
+                    AND COALESCE(sv.micro_variant,'')=COALESCE(ps.micro_variant,'') THEN 1
+               ELSE 2 END AS affinity
+        FROM psa_specs ps
+        JOIN variants pv ON pv.variant_id=ps.variant_id
+        JOIN variants sv ON sv.card_id=pv.card_id
+        WHERE ps.namespace='sales' AND ps.match_status IN ('matched','manual'))
+      WHERE 1=1${extra}),
+    latest_sales_spec AS (SELECT psa_spec_pk,variant_id,affinity,
+      ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY affinity ASC,
+        EXISTS(SELECT 1 FROM psa_sales s WHERE s.sales_spec_pk=psa_spec_pk) DESC,
+        fetched_at DESC,psa_spec_pk DESC) rn
+      FROM sales_spec_variant),
     ranked_sales AS (SELECT lss.variant_id,s.sale_price,s.sale_date,
       ROW_NUMBER() OVER(PARTITION BY lss.variant_id ORDER BY s.sale_date DESC,s.sale_row_id DESC) rn,
       COUNT(*) OVER(PARTITION BY lss.variant_id) sale_count,
@@ -241,7 +274,8 @@ function auctionRows(db:DatabaseSync,auctionId?:number):Row[]{
     FROM ebay_listings e JOIN latest_price lp ON lp.ebay_listing_id=e.ebay_listing_id AND lp.rn=1
     JOIN v_variant_search v ON v.variant_id=e.variant_id
     WHERE e.variant_id IS NOT NULL AND e.grade_value=10 AND e.is_lot=0 AND e.flagged=0 AND e.match_status IN ('matched','manual')
-      AND e.match_tier IN ('exact','strong') ${idSql}`).all(...(auctionId==null?[]:[auctionId])) as unknown as Row[];
+      AND e.match_tier IN ('exact','strong')
+      AND (e.match_method IS NULL OR e.match_method <> 'ebay-cluster-propagate') ${idSql}`).all(...(auctionId==null?[]:[auctionId])) as unknown as Row[];
 }
 
 function comparison(psaGuide:number|null,bid:number|null,currency:string|null,fx:FxRateMeta|null){

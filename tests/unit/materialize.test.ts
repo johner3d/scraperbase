@@ -596,3 +596,109 @@ test('an unresolvable listing is queued, and resolving it manually also teaches 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function addCertObservation(
+  db: ReturnType<typeof openDb>,
+  runId: string,
+  certNumber: string,
+  html: string,
+  observedAt = '2026-08-31T00:00:00.000Z',
+): Promise<void> {
+  // Deliberately written to the DEFAULT object store, which is where the cert
+  // collector puts it -- the eBay raw store is a different directory.
+  const scopeKey = `cert:${certNumber}`;
+  const workItemId = enqueueWorkItem(db, { source: 'psa', queue: 'psa_cert', entityType: 'cert', scopeKey, params: {} });
+  const object = await writeObject(db, {
+    source: 'psa', mediaKind: 'html', mediaType: 'text/html', ext: 'html', body: Buffer.from(html, 'utf8'),
+  });
+  const attempt = db.prepare(
+    `INSERT INTO attempts (work_item_id, run_id, started_at, finished_at, outcome, http_status, request_method, request_url, byte_size, content_hash, source_identity)
+     VALUES (?, ?, ?, ?, 'success', 200, 'GET', ?, ?, ?, 'psa') RETURNING attempt_id`,
+  ).get(workItemId, runId, observedAt, observedAt, `https://www.psacard.com/cert/${certNumber}`, object.byteSize, object.hash) as { attempt_id: number };
+  db.prepare(
+    `INSERT INTO observations (attempt_id, work_item_id, hash, observed_at, entity_type, scope_key, is_first_observation_of_hash)
+     VALUES (?, ?, ?, ?, 'cert', ?, 1)`,
+  ).run(attempt.attempt_id, workItemId, object.hash, observedAt, scopeKey);
+}
+
+test('a stored cert page identifies the listing even though eBay payloads live in a different object store', async () => {
+  // Regression: buildCertVariantMap was handed the eBay raw dirs, so every cert
+  // read missed, the map came back empty and no listing was ever identified by
+  // its slab. The two stores being different directories is the whole point.
+  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-cert-store-'));
+  const db = openDb(path.join(root, 'db.sqlite'));
+  const ebayDirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
+  try {
+    const variantId = seedCardVariant(db, { language: 'ja', sourceSetId: 'SV-P', setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu', dexId: 25 });
+    const runId = createRun(db, 'cert-fixture', {});
+    const now = '2026-08-31T00:00:00.000Z';
+    // A population spec PSA already knows, pointing at the seeded variant.
+    const record = db.prepare(`INSERT INTO source_records (source, namespace, source_key, entity_type, first_seen_at, last_seen_at)
+      VALUES ('psa','population','4881155','population',?,?) RETURNING source_record_id`).get(now, now) as { source_record_id: number };
+    db.prepare(`INSERT INTO psa_specs (namespace, spec_id, source_record_id, variant_id, release, source_card_id, finish, match_status, match_method, fetched_at)
+      VALUES ('population','4881155',?,?,'SV-P','SV-P-218','holo','matched','psa-explicit-selection',?)`).run(record.source_record_id, variantId, now);
+
+    await addEbayItemObservation(db, ebayDirs, runId, 'de', '206485945782', psa10DeListing({
+      localizedAspects: [
+        { name: 'Kartenname', value: 'Pikachu' },
+        { name: 'Kartennummer', value: '218' },
+        { name: 'Set', value: 'SV-P Werbekarten' },
+        { name: 'Sprache', value: 'Japanische' },
+        { name: 'Zertifizierungsnummer', value: '70352452' },
+      ],
+    }));
+    await addCertObservation(db, runId, '70352452', '<a href="/spec/psa/4881155">Population report</a>');
+
+    await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs, objectStoreDirs: undefined });
+    const listing = db.prepare(`SELECT variant_id, match_method, match_tier, variant_confidence FROM ebay_listings`).get() as
+      { variant_id: number; match_method: string; match_tier: string; variant_confidence: string };
+    assert.equal(listing.match_method, 'ebay-psa-cert', 'the cert, not the title, identified the slab');
+    assert.equal(listing.variant_id, variantId);
+    assert.equal(listing.match_tier, 'exact');
+    assert.equal(listing.variant_confidence, 'proven');
+  } finally {
+    db.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a cert naming a SpecID no pop-report crawl has reached still becomes a fetchable spec', async () => {
+  // Most modern Japanese sets have no mapped PSA heading, so the spec the cert
+  // names does not exist yet. The cert plus the listing's own match is enough
+  // to create it, which is what puts the auction in front of the fetch queues.
+  const root = await mkdtemp(path.join(tmpdir(), 'scraperbase-cert-mint-'));
+  const db = openDb(path.join(root, 'db.sqlite'));
+  const ebayDirs: ObjectStoreDirs = { objectsDir: path.join(root, 'ebay-raw'), objectsTmpDir: path.join(root, 'ebay-raw', 'tmp') };
+  try {
+    const variantId = seedCardVariant(db, { language: 'ja', sourceSetId: 'SV-P', setName: 'SV-P Werbekarten', cardLocalId: '218', cardNumber: '218', cardName: 'Pikachu', dexId: 25 });
+    const runId = createRun(db, 'cert-mint-fixture', {});
+    await addEbayItemObservation(db, ebayDirs, runId, 'de', '206485945782', psa10DeListing({
+      localizedAspects: [
+        { name: 'Kartenname', value: 'Pikachu' },
+        { name: 'Kartennummer', value: '218' },
+        { name: 'Set', value: 'SV-P Werbekarten' },
+        { name: 'Sprache', value: 'Japanische' },
+        { name: 'Zertifizierungsnummer', value: '143313510' },
+      ],
+    }));
+    // First pass establishes the listing -> variant link the mint reads from.
+    await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs });
+    await addCertObservation(db, runId, '143313510', '{"specId":"14158169"}');
+
+    await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs });
+    const spec = db.prepare(`SELECT spec_id, variant_id, match_status, match_method, release FROM psa_specs WHERE namespace='population'`).get() as
+      { spec_id: string; variant_id: number; match_status: string; match_method: string; release: string };
+    assert.equal(spec.spec_id, '14158169');
+    assert.equal(spec.variant_id, variantId);
+    assert.equal(spec.match_status, 'matched');
+    assert.equal(spec.match_method, 'psa-cert-lookup', 'distinguishable from a pop-report match');
+    assert.equal(spec.release, 'SV-P');
+
+    // Minting is idempotent and never clobbers an existing spec row.
+    await materialize(db, { includeTcgdex: false, includePsa: false, ebayDirs });
+    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM psa_specs WHERE namespace='population'`).get() as { n: number }).n, 1);
+  } finally {
+    db.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

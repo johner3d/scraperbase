@@ -23,7 +23,7 @@ npm run cli -- pipeline terms enable|disable|remove <id|query>
 
 # run it
 npm run cli -- pipeline start                  # the daemon (add to start.ps1 with -Pipeline)
-npm run cli -- pipeline start --stages ingest,ebay-match,psa-cert
+npm run cli -- pipeline start --stages ingest,ebay-match,psa
 npm run cli -- pipeline start --retry-failed   # clear all dead-letters on startup
 npm run cli -- pipeline stop                   # drains in-flight work, then exits (Ctrl+C also works)
 npm run cli -- pipeline tick [all|<stage>]     # one bounded pass, then exit (for Task Scheduler / debugging)
@@ -41,8 +41,8 @@ npm run cli -- pipeline dead-letter resolve --stage <s> --scope <key>   # won't-
 npm run cli -- pipeline publish --now
 ```
 
-Supervisor stages: `ingest -> ebay-match -> psa-cert -> psa-identity -> psa-fetch -> publish`,
-plus a daily `reconcile` full rebuild that heals any incremental drift. Each stage:
+Supervisor stages: `ingest -> ebay-match -> psa -> publish`, plus a daily `reconcile` full
+rebuild that heals any incremental drift. Each stage:
 
 - does a bounded unit of work per tick and commits per item (no batch handoff),
 - backs itself off when there's nothing to do,
@@ -50,8 +50,15 @@ plus a daily `reconcile` full rebuild that heals any incremental drift. Each sta
   never aborts the pipeline),
 - has a watchdog so a slow stage can't block the others.
 
-`psa-fetch` only ever targets auctions that are **still live**, soonest-closing first — ended
-auctions never cost PSA quota. eBay `auction` search terms fetch an item-detail call only for
+The single **`psa`** stage owns every psacard.com fetch — cert-number lookups, pop-tree
+identity discovery, and population/price/sales enrichment — behind **one warm shared browser
+session**, **one shared request rate budget**, and **one 429 circuit-breaker** (a rate-limit in
+any phase parks all PSA work with an escalating back-off, recorded as a single pause and
+rehydrated across restarts). Each tick is bounded (~150 s) and spends the budget **fetch-first**:
+enrichment for the soonest-closing live auctions, then cert lookups, then — only with headroom
+left — the expensive identity crawl. Dead-letters and `pipeline retry` still accept the old
+`psa-cert` / `psa-identity` / `psa-fetch` sub-labels. Only auctions that are **still live** are
+ever fetched, soonest-closing first — ended auctions never cost PSA quota. eBay `auction` search terms fetch an item-detail call only for
 listings with real bids ending inside the window.
 
 Only one writer at a time: `pipeline start` and the one-shot `pipeline run` below are mutually

@@ -12,9 +12,8 @@ import { beginSupervisor, endSupervisor, ensureSupervisorPipelineRun, getSupervi
 import { SUPERVISOR_STAGES, type StageContext, type StageTick, type StageTickResult, type SupervisorStage } from './stages/types.ts';
 import { tickIngest } from './stages/ingest.ts';
 import { tickEbayMatch } from './stages/ebayMatch.ts';
-import { tickPsaCert } from './stages/psaCert.ts';
-import { tickPsaIdentity } from './stages/psaIdentity.ts';
-import { tickPsaFetch } from './stages/psaFetch.ts';
+import { tickPsa } from './stages/psa.ts';
+import { closePsaBrowser, releasePsaBrowserIfIdle } from './stages/psaBrowser.ts';
 import { tickPublish } from './stages/publish.ts';
 import { tickReconcile } from './stages/reconcile.ts';
 import { retryDeadLetters } from './deadLetters.ts';
@@ -24,9 +23,7 @@ export const STOP_FILE = path.join(DATA_DIR, 'pipeline.stop');
 const REGISTRY: Record<SupervisorStage, { tick: StageTick; maxTickMs: number }> = {
   ingest:         { tick: tickIngest,      maxTickMs: 180_000 },
   'ebay-match':   { tick: tickEbayMatch,   maxTickMs: 120_000 },
-  'psa-cert':     { tick: tickPsaCert,     maxTickMs: 300_000 },
-  'psa-identity': { tick: tickPsaIdentity, maxTickMs: 600_000 },
-  'psa-fetch':    { tick: tickPsaFetch,    maxTickMs: 420_000 },
+  psa:            { tick: tickPsa,         maxTickMs: 180_000 },
   publish:        { tick: tickPublish,     maxTickMs: 120_000 },
   reconcile:      { tick: tickReconcile,   maxTickMs: 900_000 },
 };
@@ -186,11 +183,14 @@ export async function runSupervisor(dbInput: DatabaseSync | null, opts: Supervis
         }
       }
 
+      await releasePsaBrowserIfIdle(Date.now());
+
       if (opts.once) break;
       if (!didWork) await sleep(opts.loopFloorMs ?? LOOP_FLOOR_MS);
       else await sleep(50);
     }
   } finally {
+    await closePsaBrowser();
     finishRun(db, runId, 'completed');
     endSupervisor(db);
     for (const stage of stages) {

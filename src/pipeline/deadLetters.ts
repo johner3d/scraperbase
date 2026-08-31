@@ -43,8 +43,12 @@ export function listDeadLetters(db: DatabaseSync, opts: { stage?: string; includ
 }
 
 export function openDeadLetterCount(db: DatabaseSync, stage: string): number {
-  return Number((db.prepare(`SELECT COUNT(*) n FROM pipeline_dead_letters WHERE stage=? AND resolved_at IS NULL`)
-    .get(stage) as { n: number }).n);
+  // Dead-letters are still recorded under the pre-merge PSA sub-labels; the
+  // single `psa` supervisor stage owns all of them.
+  const stages = stage === 'psa' ? ['psa', 'psa-cert', 'psa-identity', 'psa-fetch'] : [stage];
+  const ph = stages.map(() => '?').join(',');
+  return Number((db.prepare(`SELECT COUNT(*) n FROM pipeline_dead_letters WHERE stage IN (${ph}) AND resolved_at IS NULL`)
+    .get(...stages) as { n: number }).n);
 }
 
 /** Mark one dead-letter thread "won't fix" without retrying it. */
@@ -56,6 +60,9 @@ export function resolveDeadLetter(db: DatabaseSync, stage: string, scopeKey: str
 const STAGE_QUEUES: Record<string, string[]> = {
   ingest: ['ebay_search', 'ebay_item_detail'],
   'ebay-match': [],
+  // The live supervisor stage. The granular labels below are kept because
+  // dead-letters are still recorded under them (`pipeline retry --stage psa-fetch`).
+  psa: ['psa_cert', 'psa_pop_discovery', 'psa_pop_set_items', 'psa_enrichment_population', 'psa_enrichment_sales'],
   'psa-cert': ['psa_cert'],
   'psa-identity': ['psa_pop_discovery', 'psa_pop_set_items'],
   'psa-fetch': ['psa_enrichment_population', 'psa_enrichment_sales'],

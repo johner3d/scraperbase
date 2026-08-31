@@ -32,6 +32,17 @@ export class PsaSessionExpiredError extends Error {
 export function isPsaSignInUrl(url: string): boolean {
   return /collectors\.com\/(signin|login)|psacard\.com\/(signin|login)|\/account\/login/i.test(url);
 }
+
+/**
+ * True when a response body is Cloudflare's "Just a moment..." interstitial
+ * rather than real content. A background `page.evaluate(fetch())` can't run the
+ * JS challenge, so it sees this whenever the tab's `cf_clearance` cookie has
+ * lapsed -- the caller must re-warm the tab (a real navigation) before retrying.
+ */
+export function looksLikeCloudflareChallenge(body: string): boolean {
+  if (body.length > 40_000) return false; // real pages are far bigger than the interstitial
+  return /Just a moment\.\.\.|_cf_chl_opt|challenge-platform|Enable JavaScript and cookies to continue|cf-browser-verification/i.test(body);
+}
 export const BOOTSTRAP_URL = 'https://www.psacard.com/cardfacts/pokemon/base-set/card/641285';
 const SALES_PAGE_SIZE = 5; // hard server-side limit, confirmed live
 // Real cap now, not a theoretical one: 400 pages x 5 rows = 2,000 sales, well
@@ -122,7 +133,10 @@ export function requestStop(reason: string): void {
 }
 
 /** SIGINT/SIGTERM both stop after the current sales page has been checkpointed. */
+let stopHandlersInstalled = false;
 export function installStopHandlers(): void {
+  if (stopHandlersInstalled) return;
+  stopHandlersInstalled = true;
   process.once('SIGINT', () => requestStop('SIGINT'));
   process.once('SIGTERM', () => requestStop('SIGTERM'));
 }

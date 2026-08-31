@@ -9,9 +9,10 @@ export type { StageStatusView, SupervisorStatusView, TermFunnelView };
 
 const STAGE_QUEUES: Record<string, string[]> = {
   ingest: ['ebay_search', 'ebay_item_detail'],
-  'psa-cert': ['psa_cert'],
-  'psa-identity': ['psa_pop_discovery', 'psa_pop_set_items'],
-  'psa-fetch': ['psa_enrichment_population', 'psa_enrichment_sales'],
+  psa: [
+    'psa_cert', 'psa_pop_discovery', 'psa_pop_set_items',
+    'psa_enrichment_population', 'psa_enrichment_sales',
+  ],
 };
 
 function queueCounts(db: DatabaseSync, queues: string[]): { pending: number; inFlight: number; retryable: number; permanentFailed: number } {

@@ -574,7 +574,7 @@ function resolvePsaVariant(db:DatabaseSync,data:PsaIssue,sourceRecordId:number,a
   linkSource(db,sourceRecordId,'variant',variantId,'matched','psa-explicit-selection',at);
   return{variantId,status:'matched'};
 }
-function upsertPsaSpec(db:DatabaseSync,namespace:'population'|'sales',data:PopulationFile|SalesFile,sourceRecordId:number,variantId:number|null,status:'matched'|'manual'|'unmatched'):number{
+function upsertPsaSpec(db:DatabaseSync,namespace:'population'|'sales',data:PopulationFile|SalesFile,sourceRecordId:number,variantId:number|null,status:'matched'|'manual'|'unmatched',matchedMethod:string='psa-explicit-selection'):number{
   const specId=namespace==='population'?String((data as PopulationFile).psaSpecId):String((data as SalesFile).salesSpecId);
   const url=namespace==='population'?(data as PopulationFile).popSourceUrl:(data as SalesFile).salesSourceUrl;
   const sales=namespace==='sales'?data as SalesFile:null;
@@ -588,9 +588,9 @@ function upsertPsaSpec(db:DatabaseSync,namespace:'population'|'sales',data:Popul
       coverage_cutoff=excluded.coverage_cutoff,coverage_total_count=excluded.coverage_total_count,
       coverage_pages_fetched=excluded.coverage_pages_fetched,coverage_complete=excluded.coverage_complete RETURNING psa_spec_pk`).get(
         namespace,specId,sourceRecordId,variantId,nullableText(data.release),data.sourceCardId,nullableText(data.finish),nullableText(data.printRunMarker),
-        nullableText(data.microVariant),url,status,status==='matched'?'psa-explicit-selection':status==='manual'?'manual-match-override':null,data.fetchedAt,
+        nullableText(data.microVariant),url,status,status==='matched'?matchedMethod:status==='manual'?'manual-match-override':null,data.fetchedAt,
         sales?.cutoffIso??null,sales?.totalCount??null,sales?.pagesFetched??null,sales?.coverageComplete==null?null:sales.coverageComplete?1:0) as {psa_spec_pk:number}).psa_spec_pk;
-  linkSource(db,sourceRecordId,'psa_spec',pk,status,status==='matched'?'psa-explicit-selection':'psa-unresolved',data.fetchedAt,status==='unmatched'?null:1);
+  linkSource(db,sourceRecordId,'psa_spec',pk,status,status==='matched'?matchedMethod:'psa-unresolved',data.fetchedAt,status==='unmatched'?null:1);
   return pk;
 }
 function parsePopulation(data:PopulationFile,specPk:number,db:DatabaseSync,popObservation:ObservationRow|null,htmlObservation:ObservationRow|null):{population:number;prices:number;census:number}{
@@ -755,6 +755,59 @@ function resolveCanonicalPsaVariant(db:DatabaseSync,cardId:number,parts:{finish:
     if(next.length)pool=next;
   };
   narrow(parts.finish,'finish');narrow(parts.printRunMarker,'print_run_marker');narrow(parts.microVariant,'micro_variant');
+  return pool.length===1?pool[0]!.variant_id:null;
+}
+
+/**
+ * PSA writes a language word into `Variety` ("German", "German-Secret"), which
+ * `inferVariantSignals` then carries into micro_variant. No catalogue variant
+ * carries a language in that field -- the language lives on the set -- so the
+ * token has to come off before micro-variants can be compared at all.
+ */
+const PSA_LANGUAGE_TOKEN=/(^|_)(english|german|japanese|french|italian|spanish|korean|portuguese|chinese)(_|$)/g;
+export function psaMicroVariantKey(value:unknown):string{
+  let key=normalizePart(value),previous='';
+  while(key!==previous){previous=key;key=key.replace(PSA_LANGUAGE_TOKEN,'$1$3').replace(/__+/g,'_').replace(/^_+|_+$/g,'');}
+  return key;
+}
+
+/**
+ * The variant a PSA spec describes *exactly*, or null.
+ *
+ * Unlike resolveCanonicalPsaVariant this considers PSA-created variants too and
+ * refuses to settle for a near miss: the catalogue holds both a tcgdex row and a
+ * PSA row for many cards, and a spec for (say) a Master Ball reverse must never
+ * land on the plain holo row just because that is the only tcgdex candidate.
+ * Used by the cert path, where an exact identification is the whole point; the
+ * bulk pop-report path keeps its more forgiving resolver.
+ */
+function resolveExactPsaVariant(db:DatabaseSync,cardId:number,parts:{finish:string;printRunMarker:string;microVariant:string}):number|null{
+  const rows=db.prepare(`SELECT v.variant_id,v.finish,v.print_run_marker,v.micro_variant,
+      CASE WHEN v.source_record_id IS NULL THEN 1 WHEN sr.source='tcgdex' THEN 1 ELSE 0 END AS is_tcgdex
+    FROM variants v LEFT JOIN source_records sr ON sr.source_record_id=v.source_record_id
+    WHERE v.card_id=? ORDER BY v.variant_id`)
+    .all(cardId) as unknown as Array<{variant_id:number;finish:string|null;print_run_marker:string|null;micro_variant:string|null;is_tcgdex:number}>;
+  if(rows.length===0)return null;
+  const wantedMicro=psaMicroVariantKey(parts.microVariant);
+  let pool=rows.filter((row)=>psaMicroVariantKey(row.micro_variant)===wantedMicro);
+  if(pool.length===0)return null;
+  const wantedFinish=normalizePart(parts.finish);
+  if(wantedFinish){
+    const next=pool.filter((row)=>normalizePart(row.finish)===wantedFinish);
+    if(next.length===0)return null;
+    pool=next;
+  }
+  if(pool.length===1)return pool[0]!.variant_id;
+  // A tie here is the tcgdex row and its PSA duplicate. The catalogue row wins:
+  // it is what the eBay matcher and the web read path already point at.
+  const catalogue=pool.filter((row)=>row.is_tcgdex===1);
+  if(catalogue.length===1)return catalogue[0]!.variant_id;
+  if(catalogue.length>1)pool=catalogue;
+  const wantedMarker=normalizePart(parts.printRunMarker);
+  if(wantedMarker){
+    const next=pool.filter((row)=>normalizePart(row.print_run_marker)===wantedMarker);
+    if(next.length)pool=next;
+  }
   return pool.length===1?pool[0]!.variant_id:null;
 }
 
@@ -1010,18 +1063,30 @@ interface CertMatch { variantId:number; cardId:number }
  * mapped to a catalogue variant yet, are simply absent from the map -- those
  * listings fall through to the scored matcher exactly as before.
  */
-async function buildCertVariantMap(db:DatabaseSync,dirs:ObjectStoreDirs):Promise<Map<string,CertMatch>> {
+async function buildCertVariantMap(db:DatabaseSync,dirs?:ObjectStoreDirs):Promise<Map<string,CertMatch>> {
   const map=new Map<string,CertMatch>();
   const rows=latestObservations(db,'cert');
   if(!rows.length) return map;
   const specToVariant=new Map<string,CertMatch>();
-  for(const row of db.prepare(`SELECT ps.spec_id, ps.variant_id, v.card_id FROM psa_specs ps
-    JOIN variants v ON v.variant_id = ps.variant_id WHERE ps.variant_id IS NOT NULL`).all() as unknown as
-    Array<{spec_id:string;variant_id:number;card_id:number}>){
-    specToVariant.set(row.spec_id,{variantId:row.variant_id,cardId:row.card_id});
+  for(const row of db.prepare(`SELECT ps.spec_id, ps.variant_id, ps.finish, ps.print_run_marker, ps.micro_variant, v.card_id
+    FROM psa_specs ps JOIN variants v ON v.variant_id = ps.variant_id
+    WHERE ps.namespace='population' AND ps.variant_id IS NOT NULL`).all() as unknown as
+    Array<{spec_id:string;variant_id:number;card_id:number;finish:string|null;print_run_marker:string|null;micro_variant:string|null}>){
+    // The bulk spec->variant link can sit on a neighbouring variant of the same
+    // card (the catalogue carries both a tcgdex row and a PSA-created row for
+    // many cards). A cert is an exact identification of one slab, so re-resolve
+    // it here against the spec's own variant signals and prefer an exact
+    // micro-variant hit before trusting the stored link.
+    const exact=resolveExactPsaVariant(db,row.card_id,{
+      finish:row.finish??'',printRunMarker:row.print_run_marker??'',microVariant:row.micro_variant??'',
+    });
+    specToVariant.set(row.spec_id,exact!=null?{variantId:exact,cardId:row.card_id}:{variantId:row.variant_id,cardId:row.card_id});
   }
   for(const row of rows){
     const cert=/^cert:(.+)$/.exec(row.scope_key)?.[1]; if(!cert) continue;
+    // Cert pages live in the DEFAULT object store (data/objects/psa/html/...),
+    // not the eBay raw store that the surrounding eBay materialize uses. Passing
+    // the eBay dirs here made every read miss and the map silently empty.
     const html=await readObservationText(row,dirs); if(html==null) continue;
     const specId=extractSpecId(html); if(!specId) continue;
     const found=specToVariant.get(specId); if(found) map.set(cert,found);
@@ -1092,7 +1157,7 @@ async function materializeEbay(db:DatabaseSync,at:string,dirs:ObjectStoreDirs,pi
   // it. Resolved rows are history and are kept.
   db.prepare(`DELETE FROM match_reviews WHERE status='open' AND source_record_id IN
     (SELECT source_record_id FROM source_records WHERE source='ebay')`).run();
-  const ctx:EbayRowContext={matcher:createEbayMatcher(db),certVariants:await buildCertVariantMap(db,dirs),pipelineRunId};
+  const ctx:EbayRowContext={matcher:createEbayMatcher(db),certVariants:await buildCertVariantMap(db),pipelineRunId};
   let listings=0,matchedListings=0,priceObservations=0;
   for(const row of rows){
     const r=await materializeEbayRow(db,at,dirs,row,ctx);
@@ -1119,7 +1184,7 @@ async function materializeEbayIncremental(db:DatabaseSync,at:string,dirs:ObjectS
   db.prepare(`DELETE FROM match_reviews WHERE status='open' AND source_record_id IN
     (SELECT sr.source_record_id FROM source_records sr WHERE sr.source='ebay'
       AND 'item:'||sr.namespace||':'||sr.source_key IN (${placeholders}))`).run(...rows.map((r)=>r.scope_key));
-  const ctx:EbayRowContext={matcher:createEbayMatcher(db),certVariants:await buildCertVariantMap(db,dirs),pipelineRunId};
+  const ctx:EbayRowContext={matcher:createEbayMatcher(db),certVariants:await buildCertVariantMap(db),pipelineRunId};
   let listings=0,matchedListings=0,priceObservations=0;
   for(const row of rows){
     const r=await materializeEbayRow(db,at,dirs,row,ctx);
@@ -1128,6 +1193,60 @@ async function materializeEbayIncremental(db:DatabaseSync,at:string,dirs:ObjectS
     if(r.priceObservation) priceObservations++;
   }
   return {listings,matchedListings,priceObservations};
+}
+
+/**
+ * Creates the population spec a cert page names, when our pop-report crawl has
+ * never reached the heading that spec lives under.
+ *
+ * PSA's cert page states the SpecID outright, so for a slab we already hold we
+ * do not need the /Pop/GetSetItems tree to have been walked first -- and for
+ * most modern Japanese sets it has not been (confirmed 2026-08-31: SV-P, SV8,
+ * S8b, M1L, M2, M3 and others have zero mapped headings). The listing's own
+ * match supplies the variant, the cert supplies the spec, and the enrichment
+ * queues can then fetch population and sales for it like any other target.
+ *
+ * Only listings whose variant is already established are used, and an existing
+ * spec row is never overwritten -- the pop-report path stays authoritative
+ * wherever it has actually run.
+ */
+async function mintCertOnlyPsaSpecs(db:DatabaseSync,at:string):Promise<number>{
+  const rows=latestObservations(db,'cert');
+  if(!rows.length) return 0;
+  const listingByCert=new Map<string,{variantId:number;cardId:number;sourceSetId:string;localId:string;
+    finish:string|null;printRunMarker:string|null;microVariant:string|null}>();
+  for(const row of db.prepare(`SELECT TRIM(e.cert_number) AS cert, v.variant_id, v.card_id, v.finish, v.print_run_marker,
+      v.micro_variant, s.source_set_id, c.local_id
+    FROM ebay_listings e
+    JOIN variants v ON v.variant_id=e.variant_id
+    JOIN cards c ON c.card_id=v.card_id
+    JOIN sets s ON s.set_id=c.set_id
+    WHERE e.cert_number IS NOT NULL AND TRIM(e.cert_number)<>''`).all() as unknown as
+    Array<{cert:string;variant_id:number;card_id:number;finish:string|null;print_run_marker:string|null;
+      micro_variant:string|null;source_set_id:string;local_id:string}>){
+    if(listingByCert.has(row.cert)) continue;
+    listingByCert.set(row.cert,{variantId:row.variant_id,cardId:row.card_id,sourceSetId:row.source_set_id,
+      localId:row.local_id,finish:row.finish,printRunMarker:row.print_run_marker,microVariant:row.micro_variant});
+  }
+  const existing=db.prepare(`SELECT 1 FROM psa_specs WHERE namespace='population' AND spec_id=?`);
+  let minted=0;
+  for(const row of rows){
+    const cert=/^cert:(.+)$/.exec(row.scope_key)?.[1]; if(!cert) continue;
+    const listing=listingByCert.get(cert); if(!listing) continue;
+    const html=await readObservationText(row); if(html==null) continue;
+    const specId=extractSpecId(html); if(!specId) continue;
+    if(existing.get(specId)) continue;
+    const record=upsertSourceRecord(db,{source:'psa',namespace:'population',sourceKey:specId,
+      entityType:'population',language:null,observation:row,observedAt:at});
+    upsertPsaSpec(db,'population',{
+      release:listing.sourceSetId,sourceCardId:`${listing.sourceSetId}-${listing.localId}`,
+      finish:listing.finish??'',printRunMarker:listing.printRunMarker??'',microVariant:listing.microVariant??'',
+      psaSpecId:specId,popSourceUrl:`https://www.psacard.com/spec/psa/${specId}`,salesSpecId:specId,
+      fetchedAt:at,populationRaw:'{}',
+    },record,listing.variantId,'matched','psa-cert-lookup');
+    minted++;
+  }
+  return minted;
 }
 
 async function materializeEcb(db:DatabaseSync,at:string,dirs?:ObjectStoreDirs):Promise<number>{
@@ -1157,6 +1276,7 @@ export async function materialize(db:DatabaseSync,options:MaterializeOptions={})
         Object.assign(result,psa);
       }
       if(options.includeEbay!==false&&options.changedEbayScopeKeys){
+        result.psaSpecs+=await mintCertOnlyPsaSpecs(db,at);
         const ebay=await materializeEbayIncremental(db,at,options.ebayDirs??EBAY_RAW_DIRS,options.changedEbayScopeKeys,options.pipelineRunId);
         result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;
       }
@@ -1169,7 +1289,12 @@ export async function materialize(db:DatabaseSync,options:MaterializeOptions={})
       const native=await materializePsaNative(db,at,options.objectStoreDirs);
       result.psaSpecs+=native.psaSpecs;result.populationRows+=native.populationRows;result.matchedPsaSpecs+=native.matchedPsaSpecs;
     }
-    if(options.includeEbay!==false){const ebay=await materializeEbay(db,at,options.ebayDirs??EBAY_RAW_DIRS,options.pipelineRunId);result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;}
+    if(options.includeEbay!==false){
+      // Before the eBay pass, not after: materializeEbay builds its cert->variant
+      // map up front, so a spec minted here only reaches the override on the
+      // next run unless it already exists when that map is built.
+      result.psaSpecs+=await mintCertOnlyPsaSpecs(db,at);
+      const ebay=await materializeEbay(db,at,options.ebayDirs??EBAY_RAW_DIRS,options.pipelineRunId);result.ebayListings=ebay.listings;result.matchedEbayListings=ebay.matchedListings;result.ebayPriceObservations=ebay.priceObservations;}
     if(options.includeEcb!==false)result.exchangeRates=await materializeEcb(db,at,options.objectStoreDirs);
     result.openReviews=Number((db.prepare(`SELECT COUNT(*) n FROM match_reviews WHERE status='open'`).get() as {n:number}).n);
     db.exec('COMMIT');return result;

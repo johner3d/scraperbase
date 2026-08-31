@@ -73,7 +73,7 @@ test('openDb creates every table and is idempotent across repeated opens', async
     const db2 = openDb(dbPath);
     try {
       const version = db2.prepare('PRAGMA user_version').get() as { user_version: number };
-      assert.equal(version.user_version, 15);
+      assert.equal(version.user_version, 18);
     } finally {
       db2.close();
     }

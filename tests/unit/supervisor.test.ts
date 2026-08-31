@@ -39,7 +39,7 @@ test('supervisorStatus reports every stage, quota, and per-term funnels', async 
     const status = supervisorStatus(db);
     assert.equal(status.running, false);
     assert.deepEqual(status.stages.map((s) => s.stage).sort(),
-      ['ebay-match', 'ingest', 'psa-cert', 'psa-fetch', 'psa-identity', 'publish', 'reconcile']);
+      ['ebay-match', 'ingest', 'psa', 'publish', 'reconcile']);
     assert.equal(status.quota.limit, 4500);
     assert.equal(status.terms.length, 1);
     assert.deepEqual(status.terms[0]!.funnel, { found: 0, detailed: 0, matched: 0, psaTargetedLive: 0, population: 0, guide: 0, sales: 0 });

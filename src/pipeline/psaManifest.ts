@@ -154,9 +154,21 @@ export function snapshotPsaTargets(db: DatabaseSync, pipelineRunId: string,
     const listingCount=Number((db.prepare(`SELECT COUNT(DISTINCT l.ebay_listing_id) n FROM pipeline_psa_targets t
       JOIN pipeline_psa_target_listings l ON l.pipeline_psa_target_id=t.pipeline_psa_target_id
       WHERE t.pipeline_run_id=?`).get(pipelineRunId) as {n:number}).n);
-    db.prepare(`INSERT INTO pipeline_psa_manifest_revisions
-      (pipeline_run_id,manifest_revision,ebay_complete,new_target_count,listing_count,created_at)
-      VALUES(?,?,?,?,?,?)`).run(pipelineRunId,revision,options.ebayComplete?1:0,newTargets,listingCount,now);
+    // Only append a revision row when the manifest actually moved. A `refresh`
+    // that adds no targets and doesn't change the listing count or ebay-complete
+    // flag is a no-op -- recording it just grows this table unbounded on every
+    // idle tick.
+    const prev=db.prepare(`SELECT ebay_complete,listing_count FROM pipeline_psa_manifest_revisions
+      WHERE pipeline_run_id=? ORDER BY manifest_revision DESC LIMIT 1`).get(pipelineRunId) as
+      {ebay_complete:number;listing_count:number}|undefined;
+    const unchanged=prev!=null && newTargets===0
+      && prev.listing_count===listingCount
+      && prev.ebay_complete===(options.ebayComplete?1:0);
+    if(!unchanged){
+      db.prepare(`INSERT INTO pipeline_psa_manifest_revisions
+        (pipeline_run_id,manifest_revision,ebay_complete,new_target_count,listing_count,created_at)
+        VALUES(?,?,?,?,?,?)`).run(pipelineRunId,revision,options.ebayComplete?1:0,newTargets,listingCount,now);
+    }
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');

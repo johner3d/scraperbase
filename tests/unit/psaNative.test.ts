@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { openDb } from '../../src/core/db/client.ts';
 import { materialize } from '../../src/curated/materialize.ts';
-import { autoMatchHeading, scoreCandidates } from '../../src/curated/psaSetMatch.ts';
+import { autoMatchHeading, matchHeadingBySetCode, scoreCandidates } from '../../src/curated/psaSetMatch.ts';
 import { matchPsaCardRow, type PsaSetItemRow } from '../../src/curated/psaCardMatch.ts';
 import { enqueueWorkItem } from '../../src/core/queue/scheduler.ts';
 import { createRun } from '../../src/core/queue/run.ts';
@@ -228,5 +228,33 @@ test('materializePsaNative: one heading whose stored observation is not valid Ge
       `SELECT ps.match_status FROM psa_specs ps WHERE ps.namespace='population' AND ps.spec_id='525134'`,
     ).get() as { match_status: string } | undefined;
     assert.equal(row?.match_status, 'matched');
+  });
+});
+
+test('psaSetMatch: a Japanese heading matches on its printed set code, which is all token overlap has to go on', async () => {
+  await withDb((db) => {
+    // tcgdex stores Japanese set names in Japanese; PSA romanizes them. The two
+    // share no tokens at all, so the code prefix is the only usable signal.
+    db.prepare(`INSERT INTO sets (language, source_set_id, name, created_at, updated_at)
+      VALUES ('ja','M1L','メガブレイブ',?,?), ('ja','SV8','超電ブレイカー',?,?)`).run(NOW, NOW, NOW, NOW);
+
+    assert.equal(scoreCandidates(db, 'Pokemon Japanese M1l-Mega Brave').length, 0, 'token overlap finds nothing, as expected');
+    assert.equal(matchHeadingBySetCode(db, 'Pokemon Japanese M1l-Mega Brave')?.sourceSetId, 'M1L');
+    assert.equal(matchHeadingBySetCode(db, 'Pokemon Japanese SV8-Super Electric Breaker')?.sourceSetId, 'SV8');
+
+    const row = db.prepare(
+      `INSERT INTO psa_set_map (psa_heading_id, psa_heading_name, language, match_status, created_at, updated_at)
+       VALUES (312124, 'Pokemon Japanese M1l-Mega Brave', 'ja', 'unmatched', ?, ?) RETURNING psa_set_map_id`,
+    ).get(NOW, NOW) as { psa_set_map_id: number };
+    const result = autoMatchHeading(db, row.psa_set_map_id, 'Pokemon Japanese M1l-Mega Brave', NOW);
+    assert.equal(result.status, 'matched');
+    assert.equal(result.sourceSetId, 'M1L');
+    assert.equal((db.prepare(`SELECT match_method FROM psa_set_map WHERE psa_set_map_id=?`).get(row.psa_set_map_id) as { match_method: string }).match_method, 'heading-set-code');
+
+    // A deck PSA lists but tcgdex does not carry must stay unmatched, not be
+    // forced onto some near-miss set.
+    assert.equal(matchHeadingBySetCode(db, 'Pokemon Japanese Clf-Classic Venusaur Deck'), null);
+    // The code must resolve within the heading's own language.
+    assert.equal(matchHeadingBySetCode(db, 'Pokemon German M1l-Mega Brave'), null);
   });
 });

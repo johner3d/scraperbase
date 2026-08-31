@@ -3,6 +3,7 @@ import type { Page } from 'playwright';
 import type { Collector } from '../../../core/queue/runner.ts';
 import { enqueueWorkItem } from '../../../core/queue/scheduler.ts';
 import { classifyHttpStatus } from '../../../core/http/fetchClient.ts';
+import { looksLikeCloudflareChallenge } from '../rawFetch.ts';
 import type { RateLimiter } from '../../../core/http/rateLimiter.ts';
 import { PSA_BASE } from '../config.ts';
 import { certScopeKey } from '../scopeKeys.ts';
@@ -66,6 +67,7 @@ export function seedPsaCertLookups(db: DatabaseSync, limit = 5000, liveOnly = fa
        LIMIT ?`,
   ).all(...(live ? [...live.params, limit] : [limit])) as unknown as Array<{ cert_number: string }>;
   let seeded = 0;
+  const revive: string[] = [];
   for (const row of rows) {
     const certNumber = row.cert_number.trim();
     if (!/^\d{5,12}$/.test(certNumber)) continue;
@@ -76,7 +78,21 @@ export function seedPsaCertLookups(db: DatabaseSync, limit = 5000, liveOnly = fa
       scopeKey: certScopeKey(certNumber),
       params: { certNumber },
     });
+    revive.push(certScopeKey(certNumber));
     seeded += 1;
+  }
+  // A listing still carrying an unresolved cert is worth another lookup even if
+  // a prior `pipeline reset` cancelled the work item -- `enqueueWorkItem`'s
+  // INSERT OR IGNORE can't revive those, so re-pend them explicitly (mirrors
+  // `seedPsaEnrichment({force})`).
+  if (revive.length) {
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE work_items SET state='pending', attempts=0, available_at=?, last_error=NULL,
+         lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+       WHERE queue='psa_cert' AND state='cancelled'
+         AND scope_key IN (${revive.map(() => '?').join(',')})`,
+    ).run(now, now, ...revive);
   }
   return seeded;
 }
@@ -98,6 +114,18 @@ export function createPsaCertCollector(deps: CertDeps): Collector {
       }, requestUrl).then((value)=>{clearTimeout(timer);resolve(value);},(error)=>{clearTimeout(timer);reject(error);});
     });
     const durationMs = Date.now() - start;
+
+    // A 200 whose body is Cloudflare's "Just a moment..." page is not a real
+    // answer -- the tab's clearance cookie lapsed. Fail retryably (don't store
+    // the interstitial as the cert page) so withPsaPage re-warms before retry.
+    if (looksLikeCloudflareChallenge(result.body)) {
+      return {
+        outcome: 'failure', final: 'retryable_failed', sourceIdentity,
+        httpStatus: result.status, requestMethod: 'GET', requestUrl, durationMs,
+        errorMessage: `PSA cert ${certNumber}: Cloudflare challenge, not the cert page`,
+      };
+    }
+
     const body = Buffer.from(result.body, 'utf8');
     const httpClass = classifyHttpStatus(result.status);
 

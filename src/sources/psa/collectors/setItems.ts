@@ -1,6 +1,7 @@
 import type { Page } from 'playwright';
 import type { Collector } from '../../../core/queue/runner.ts';
 import { classifyHttpStatus } from '../../../core/http/fetchClient.ts';
+import { looksLikeCloudflareChallenge } from '../rawFetch.ts';
 import type { RateLimiter } from '../../../core/http/rateLimiter.ts';
 import { POP_ROOT_CATEGORY_ID, popSetItemsEndpoint } from '../config.ts';
 
@@ -66,6 +67,14 @@ export function createPsaSetItemsCollector(deps: SetItemsDeps): Collector {
         requestUrl,
         durationMs,
         errorMessage: `HTTP ${result.status} fetching GetSetItems for heading ${headingId}`,
+      };
+    }
+
+    if (looksLikeCloudflareChallenge(result.body)) {
+      return {
+        outcome: 'failure', final: 'retryable_failed', sourceIdentity,
+        httpStatus: result.status, requestMethod: 'POST', requestUrl, durationMs,
+        errorMessage: `GetSetItems heading ${headingId}: Cloudflare challenge, not JSON`,
       };
     }
 

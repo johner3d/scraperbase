@@ -78,6 +78,31 @@ export function scoreCandidates(db: DatabaseSync, headingName: string): Array<{ 
     .sort((a, b) => b.score - a.score);
 }
 
+/**
+ * PSA prints the official set code in front of the set name for the
+ * language-prefixed headings: "Pokemon Japanese M1l-Mega Brave",
+ * "Pokemon Japanese Sv8-Super Electric Breaker". That code is exactly the
+ * tcgdex `source_set_id`.
+ *
+ * This matters because the token matcher below cannot work for Japanese at
+ * all: PSA romanizes the set name while tcgdex stores it in Japanese
+ * ("メガブレイブ"), so the two share no tokens and every Japanese heading
+ * scores zero. Confirmed 2026-08-31: 375 of 503 Japanese headings were
+ * unmatched and 78 more ambiguous.
+ *
+ * Only accepted when the code resolves to exactly one set in the heading's own
+ * inferred language, which is what keeps it honest -- PSA also has headings for
+ * decks and starter sets tcgdex does not carry, and those simply find nothing.
+ */
+const HEADING_SET_CODE = /^pokemon\s+(?:japanese|german|french|italian|spanish|korean|portuguese|chinese)\s+([A-Za-z0-9.-]{1,8})\s*-\s*\S/i;
+export function matchHeadingBySetCode(db: DatabaseSync, headingName: string): { setId: number; sourceSetId: string } | null {
+  const code = HEADING_SET_CODE.exec(headingName)?.[1];
+  if (!code) return null;
+  const rows = db.prepare(`SELECT set_id, source_set_id FROM sets WHERE language = ? AND LOWER(source_set_id) = LOWER(?)`)
+    .all(inferHeadingLanguage(headingName), code) as unknown as Array<{ set_id: number; source_set_id: string }>;
+  return rows.length === 1 ? { setId: rows[0]!.set_id, sourceSetId: rows[0]!.source_set_id } : null;
+}
+
 export interface SetMatchAttemptResult {
   status: 'matched' | 'ambiguous' | 'unmatched';
   sourceSetId: string | null;
@@ -85,6 +110,14 @@ export interface SetMatchAttemptResult {
 
 /** Auto-matches one psa_set_map row against tcgdex sets and writes the result back. */
 export function autoMatchHeading(db: DatabaseSync, psaSetMapId: number, headingName: string, at: string): SetMatchAttemptResult {
+  // An explicit set code is stronger evidence than any name similarity score,
+  // so it is tried first rather than blended into the scoring.
+  const byCode = matchHeadingBySetCode(db, headingName);
+  if (byCode) {
+    db.prepare(`UPDATE psa_set_map SET source_set_id=?, language=?, match_status='matched', match_method='heading-set-code', updated_at=? WHERE psa_set_map_id=?`)
+      .run(byCode.sourceSetId, inferHeadingLanguage(headingName), at, psaSetMapId);
+    return { status: 'matched', sourceSetId: byCode.sourceSetId };
+  }
   const candidates = scoreCandidates(db, headingName);
   const best = candidates[0];
   const runnerUp = candidates[1];
@@ -102,7 +135,8 @@ export function autoMatchHeading(db: DatabaseSync, psaSetMapId: number, headingN
 /** Runs auto-matching over every unresolved heading. Returns counts for reporting. */
 export function autoMatchAllHeadings(db: DatabaseSync, at = new Date().toISOString()): { matched: number; ambiguous: number; unmatched: number } {
   const rows = db.prepare(`SELECT psa_set_map_id, psa_heading_name FROM psa_set_map
-    WHERE match_status IN ('unmatched', 'ambiguous') OR (match_status='matched' AND match_method='token-overlap')`)
+    WHERE match_status IN ('unmatched', 'ambiguous')
+       OR (match_status='matched' AND match_method IN ('token-overlap','heading-set-code'))`)
     .all() as unknown as Array<{ psa_set_map_id: number; psa_heading_name: string }>;
   let matched = 0, ambiguous = 0, unmatched = 0;
   for (const row of rows) {

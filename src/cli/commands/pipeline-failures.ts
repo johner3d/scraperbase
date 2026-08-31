@@ -77,6 +77,7 @@ export async function pipelineDeadLetterCommand(args: string[]): Promise<void> {
 function queuesForStage(stage: string): string[] {
   return ({
     ingest: ['ebay_search', 'ebay_item_detail'],
+    psa: ['psa_cert', 'psa_pop_discovery', 'psa_pop_set_items', 'psa_enrichment_population', 'psa_enrichment_sales'],
     'psa-cert': ['psa_cert'],
     'psa-identity': ['psa_pop_discovery', 'psa_pop_set_items'],
     'psa-fetch': ['psa_enrichment_population', 'psa_enrichment_sales'],

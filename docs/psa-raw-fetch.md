@@ -1,6 +1,8 @@
 # PSA raw fetch
 
 > Production note: `pipeline run` now schedules population, guide, and complete-history sales enrichment through durable per-spec work items. The standalone commands in this document remain compatibility and recovery tools; see [`pipeline.md`](./pipeline.md).
+>
+> Supervisor note: the long-running daemon's single **`psa`** stage ([`src/pipeline/stages/psa.ts`](../src/pipeline/stages/psa.ts)) drives cert lookups, identity discovery, and enrichment through **one warm shared browser** ([`psaBrowser.ts`](../src/pipeline/stages/psaBrowser.ts) -- persistent context, reaped only when idle), **one shared rate limiter** ([`psaRateLimiter.ts`](../src/sources/psa/psaRateLimiter.ts)), and **one shared 429 circuit-breaker** ([`psaCircuit.ts`](../src/pipeline/psaCircuit.ts)). The engine below is unchanged; only the per-tick launch/close and per-phase rate budget were consolidated.
 
 Everything built so far for getting population and sales-history data out of
 PSA (psacard.com) for Pokemon cards. Three layers exist side by side right now:

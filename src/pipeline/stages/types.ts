@@ -13,9 +13,7 @@ import type { DatabaseSync } from 'node:sqlite';
 export const SUPERVISOR_STAGES = [
   'ingest',
   'ebay-match',
-  'psa-cert',
-  'psa-identity',
-  'psa-fetch',
+  'psa',
   'publish',
   'reconcile',
 ] as const;

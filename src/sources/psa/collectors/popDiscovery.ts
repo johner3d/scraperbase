@@ -3,6 +3,7 @@ import type { Page } from 'playwright';
 import type { Collector } from '../../../core/queue/runner.ts';
 import { enqueueWorkItem } from '../../../core/queue/scheduler.ts';
 import { classifyHttpStatus } from '../../../core/http/fetchClient.ts';
+import { looksLikeCloudflareChallenge } from '../rawFetch.ts';
 import type { RateLimiter } from '../../../core/http/rateLimiter.ts';
 import { PSA_BASE, POP_ROOT_CATEGORY_ID, POP_ROOT_URL } from '../config.ts';
 import { popCategoryScopeKey, popYearScopeKey, popSetItemsScopeKey } from '../scopeKeys.ts';
@@ -101,6 +102,14 @@ export function createPsaPopDiscoveryCollector(deps: PopDiscoveryDeps): Collecto
         requestUrl,
         durationMs,
         errorMessage: `HTTP ${result.status} fetching ${requestUrl}`,
+      };
+    }
+
+    if (looksLikeCloudflareChallenge(result.body)) {
+      return {
+        outcome: 'failure', final: 'retryable_failed', sourceIdentity,
+        httpStatus: result.status, requestUrl, durationMs,
+        errorMessage: `Cloudflare challenge fetching ${requestUrl}`,
       };
     }
 

@@ -26,7 +26,7 @@ test('stage control flags round-trip through pipeline_stage_status', async () =>
     setStageAuto(db, 'ingest', false);
     assert.equal(readStageControl(db, 'ingest').autoEnabled, false);
     // Other stages untouched.
-    assert.equal(readStageControl(db, 'psa-fetch').autoEnabled, true);
+    assert.equal(readStageControl(db, 'psa').autoEnabled, true);
 
     requestStageRun(db, 'ingest', true);
     const c = readStageControl(db, 'ingest');

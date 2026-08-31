@@ -90,7 +90,7 @@ function salesCollector(page:Page):Collector{
     // cutoffIso stays null so the cheap incremental/overlap path is preserved;
     // the per-spec wall-clock budget + lowered page cap in runSales are what
     // stop a single long-history spec from stalling the whole enrichment queue.
-    const stats=await runSales(page,selection.release,[selection],{force:false,maxAgeMs:maxAgeDays*DAY_MS,cutoffIso:null,auditMaxAgeMs:salesAuditDays*DAY_MS,salesBudgetMs:90_000});
+    const stats=await runSales(page,selection.release,[selection],{force:false,maxAgeMs:maxAgeDays*DAY_MS,cutoffIso:null,auditMaxAgeMs:salesAuditDays*DAY_MS,salesBudgetMs:45_000});
     if(stats.failed)return{outcome:stats.rateLimited?'rate_limited':'failure',final:stats.rateLimited?'partial':'retryable_failed',
       sourceIdentity:'psa:enrichment',httpStatus:stats.rateLimited?429:undefined,retryAfterMs:stats.rateLimited?60_000:undefined,
       errorMessage:`Sales fetch failed for ${selection.salesSpecId}${stats.rateLimited?' (rate limited)':''}`};
